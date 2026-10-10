@@ -80,14 +80,14 @@ client_type = "opencode-session"   # ← 关键：默认是 "openai"
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 是否注入会话头。关闭后请求照常转发，只是不加头 |
-| `config_version` | `1.0.0` | 配置版本，勿手改 |
+| `config_version` | `1.1.0` | 配置版本，勿手改（与插件版本号无关，仅在配置结构变化时递增） |
 
 ### `[endpoint]`
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `host_suffixes` | `["opencode.ai"]` | 视为 OpenCode 的域名后缀，自动覆盖子域 |
-| `extra_base_url_prefixes` | `[]` | 额外的 URL 前缀，用于自建/中转 OpenCode 网关 |
+| `extra_base_url_prefixes` | `[]` | 额外的 URL 前缀，用于自建/中转 OpenCode 网关。**命中这些前缀的请求，会把完整请求体（含图片 base64）与鉴权头发往该地址**，请只填你自己信任的网关 |
 
 ### `[session_header]`
 
@@ -99,8 +99,8 @@ client_type = "opencode-session"   # ← 关键：默认是 "openai"
 | `token_alphabet` | `"alphanumeric"` | `alphanumeric`（纯字母数字）或 `urlsafe` |
 | `salt` | `""` | 可选盐值；修改后所有令牌都会变化 |
 | `candidate_headers` | 见下 | 会话种子候选头，按优先级排列 |
-| `session_id_env` | `""` | 可选：找不到会话头时读取的环境变量名 |
-| `verbose` | `false` | 记录每次注入的端点、种子来源与令牌 |
+| `session_id_env` | `""` | 可选：找不到会话头时读取的环境变量名。**只填会话标识类变量名**，不要填 API Key / 密钥类变量名——种子的熵会来自该值 |
+| `verbose` | `false` | 记录每次注入的端点、种子来源与令牌。**日志里会出现令牌与端点本身**，排查完建议关掉并注意日志留存范围 |
 
 `candidate_headers` 默认值（先命中者参与哈希）：
 
@@ -177,6 +177,14 @@ Responses 的结构化输出（`text.format`）。
 * `session-` / `sess_` 一类前缀不参与哈希，避免同一会话换前缀后令牌漂移；
 * 令牌长度默认 8 位（约 47 bit 熵），只用于网关侧的会话黏连，不可逆推；
 * 增加 `salt` 可以让不同部署的令牌空间互不相干；
+* **请求会发往哪里**：插件转发的是原本就要发给模型服务商的请求。请求体（含图片 base64）
+  与鉴权头会发往该服务商 `base_url` 指向的地址；若在 `endpoint.extra_base_url_prefixes`
+  里配置了额外前缀，命中这些前缀的请求同样会把完整请求体与鉴权头发往**该前缀指向的地址**。
+  这是显式配置行为，请只在你自己信任的自建 / 中转网关上启用——除此之外，插件不会向任何
+  其他地址发送数据；
+* `session_id_env` 只应填写会话标识类变量名。若填了持有密钥的变量名，出网的虽然仍是单向
+  哈希、不可逆推，但种子的熵会来自该密钥的值；
+* `verbose` 日志会输出端点、种子来源与令牌本身，请按你所在部署的日志留存策略处理；
 * 插件只读取配置里的 URL 与请求头，不读取、不上报任何聊天内容。
 
 ## 8. 排障
@@ -255,15 +263,32 @@ opencode-session-header/
 | 项 | 值 |
 |---|---|
 | 插件 ID | `maibot.opencode-session-header` |
-| 版本 | `1.1.0` |
+| 版本 | `1.1.1` |
 | 作者 | deepseekv41flash |
 | 仓库 | https://github.com/deepseekv41flash/maibot-opencode-session-header |
 | 许可证 | MIT |
 
 插件市场按 **Release 版本**收录，Tag 与 `_manifest.json` 的 `version` 必须一致
-（`v1.1.0` ↔ `1.1.0`）。`host_application` / `sdk` 的上界按官方建议置于
+（`v1.1.1` ↔ `1.1.1`）。`host_application` / `sdk` 的上界按官方建议置于
 `999.999.999`，只认真约束 `min_version`。
 
-## 12. 许可
+## 12. 变更记录
+
+### 1.1.1
+
+* 文档：第 5 节与第 7 节补充请求转发面说明（请求体与鉴权头会发往 `base_url` 及
+  `endpoint.extra_base_url_prefixes` 命中的地址）、`session_id_env` 不应填密钥类变量名、
+  `verbose` 日志会输出令牌本身；
+* 文档：修正 `[plugin].config_version` 的默认值标注（`1.1.0`）；
+* 版本号同步至 `1.1.1`（`_manifest.json` 与 `@LLMProvider` 的 `version`）。
+
+**行为无变化**：1.1.1 不改变任何代码逻辑，配置结构未变，`config_version` 保持 `1.1.0`。
+
+### 1.1.0
+
+* 首个公开版本：命中 `opencode.ai` 端点时注入稳定的 `X-OpenCode-Session`；
+* 支持 `chat_completions` 与 `responses` 两种线上协议，并新增 `[wire]` 配置节。
+
+## 13. 许可
 
 MIT，见 [LICENSE](LICENSE)。
