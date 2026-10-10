@@ -1,0 +1,55 @@
+{
+  "manifest_version": 2,
+  "id": "maibot.opencode-session-header",
+  "version": "1.1.0",
+  "name": "OpenCode 会话头注入",
+  "description": "自动识别 opencode.ai 端点并注入稳定的 X-OpenCode-Session 请求头，避免网关返回 400 MissingSessionID；支持 chat_completions 与 responses 两种协议，会话 ID 经 SHA-256 截断哈希，其他 Provider 不受影响。",
+  "author": {
+    "name": "deepseekv41flash",
+    "url": "https://github.com/deepseekv41flash"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/deepseekv41flash/maibot-opencode-session-header",
+    "documentation": "https://github.com/deepseekv41flash/maibot-opencode-session-header#readme"
+  },
+  "host_application": {
+    "min_version": "1.3.0",
+    "max_version": "999.999.999"
+  },
+  "sdk": {
+    "min_version": "2.10.0",
+    "max_version": "999.999.999"
+  },
+  "plugin_type": "provider",
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "httpx",
+      "version_spec": ">=0.27"
+    }
+  ],
+  "llm_providers": [
+    {
+      "client_type": "opencode-session",
+      "name": "OpenCode 会话头注入",
+      "description": "转发 OpenAI 兼容请求，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
+      "version": "1.1.0"
+    }
+  ],
+  "capabilities": [
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "key-round"
+    }
+  }
+}
