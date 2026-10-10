@@ -100,7 +100,7 @@ client_type = "opencode-session"   # ← 关键：默认是 "openai"
 | `salt` | `""` | 可选盐值；修改后所有令牌都会变化 |
 | `candidate_headers` | 见下 | 会话种子候选头，按优先级排列 |
 | `session_id_env` | `""` | 可选：找不到会话头时读取的环境变量名。**只填会话标识类变量名**，不要填 API Key / 密钥类变量名——种子的熵会来自该值 |
-| `verbose` | `false` | 记录每次注入的端点、种子来源与令牌。**日志里会出现令牌与端点本身**，排查完建议关掉并注意日志留存范围 |
+| `verbose` | `false` | 记录每次注入的端点、协议、是否命中、注入的**头名**与种子来源（**不含令牌值**）。日志会暴露部署细节，排查完建议关掉 |
 
 `candidate_headers` 默认值（先命中者参与哈希）：
 
@@ -184,7 +184,9 @@ Responses 的结构化输出（`text.format`）。
   其他地址发送数据；
 * `session_id_env` 只应填写会话标识类变量名。若填了持有密钥的变量名，出网的虽然仍是单向
   哈希、不可逆推，但种子的熵会来自该密钥的值；
-* `verbose` 日志会输出端点、种子来源与令牌本身，请按你所在部署的日志留存策略处理；
+* `verbose` 日志会输出端点、协议、是否命中、注入的**头名**与种子来源（如 `fallback:provider|host`、
+  `env:NAME`）——**不输出令牌值**，也不含聊天内容；但种子来源会暴露部署细节，请按你所在部署的
+  日志留存策略处理；
 * **重定向**：HTTP 传输沿用 httpx 的默认行为（`follow_redirects=True`）。当重定向目标与
   原地址**不同源**（协议 / 主机 / 端口任一不同）时，httpx 会剥离标准 `Authorization` 头
   （同主机 `http → https` 升级除外），但**不会剥离自定义鉴权头**——即 `auth_type = "header"`
@@ -225,7 +227,8 @@ print('OK', m.id, m.version) if m else print('FAIL', v.errors)"
 * 只处理 `response` 操作（对话），不支持 embedding / 语音转写；
 * 不启用流式：`force_stream_mode` 会被忽略，结果与非流式调用一致，只是首字延迟略高；
 * 宿主发送的是「Context Item」快照，插件按主程序规则投影成 `messages`（或 Responses 的
-  `input`）；遇到未知 Item 类型会跳过而不是让请求失败；
+  `input`）；遇到未知 Item 类型会跳过而不是让请求失败，同时按数量与类型记一条 warning，
+  避免上下文静默缺块；
 * `responses` 协议下拿不到 provider replay fragment，插件会省略 reasoning 项，
   影响是跨工具轮次的推理连续性（质量层面），不会因此被网关拒绝，
   详见第 5.1 节。没有特殊需求请使用默认的 `chat_completions`。
@@ -268,16 +271,33 @@ opencode-session-header/
 | 项 | 值 |
 |---|---|
 | 插件 ID | `maibot.opencode-session-header` |
-| 版本 | `1.1.2` |
+| 版本 | `1.1.3` |
 | 作者 | deepseekv41flash |
 | 仓库 | https://github.com/deepseekv41flash/maibot-opencode-session-header |
 | 许可证 | MIT |
 
 插件市场按 **Release 版本**收录，Tag 与 `_manifest.json` 的 `version` 必须一致
-（`v1.1.2` ↔ `1.1.2`）。`host_application` / `sdk` 的上界按官方建议置于
+（`v1.1.3` ↔ `1.1.3`）。`host_application` / `sdk` 的上界按官方建议置于
 `999.999.999`，只认真约束 `min_version`。
 
 ## 12. 变更记录
+
+### 1.1.3
+
+* 修复：`endpoint.extra_base_url_prefixes` 改为按**路径段边界**匹配——此前前缀
+  `https://gw.example.com/opencode` 会连带命中 `https://gw.example.com/opencode-evil.example`，
+  把会话令牌注入到非预期地址；
+* 修复：`opencode_session_token` 工具改为**只读**路径（新增 `SessionSeedStore.peek` / `peek_host`），
+  不再为模型试探过的每个域名创建条目，避免 `session_seeds.json` 无上限增长；无既有种子时给出
+  不落盘的只读预览值并在结果中注明；
+* 改进：线格式投影遇到无法识别的 Context Item 时，按数量与类型记一条 warning（此前静默丢弃）；
+* 文档纠错：`verbose` 日志实际输出端点、协议、命中情况、注入的**头名**与种子来源，**不含令牌值**，
+  1.1.1 起的措辞过宽，本版改正；
+* 版本号同步至 `1.1.3`（`_manifest.json` 与 `@LLMProvider` 的 `version`）。
+
+**兼容性**：前缀匹配收紧属**行为变更**——若此前依赖「`/opencode` 也能命中 `/opencode-xxx`」这类
+宽松匹配，升级后需把前缀写成完整路径段（如 `https://gw.example.com/opencode/v1`）。配置结构与其余
+逻辑未变，`config_version` 保持 `1.1.0`。
 
 ### 1.1.2
 

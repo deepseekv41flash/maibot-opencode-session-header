@@ -171,9 +171,30 @@ def is_opencode_endpoint(
     if normalized:
         for raw_prefix in extra_base_url_prefixes or ():
             prefix = normalize_base_url(raw_prefix).lower()
-            if prefix and normalized.startswith(prefix):
+            if prefix and _prefix_matches(normalized, prefix):
                 return True
     return False
+
+
+def _prefix_matches(normalized: str, prefix: str) -> bool:
+    """按路径段边界比较前缀，避免 ``/opencode`` 命中 ``/opencode-evil.example``。
+
+    Args:
+        normalized: 已规范化为小写、并去掉尾斜杠的完整 URL。
+        prefix: 已规范化为小写、并去掉尾斜杠的前缀。
+
+    Returns:
+        bool: 命中返回 ``True``。
+    """
+
+    if not normalized.startswith(prefix):
+        return False
+    if len(normalized) == len(prefix):
+        return True
+    # 前缀之后必须是路径 / 查询 / 片段的分隔符；否则只是「同前缀的另一个地址」，
+    # 例如前缀 ``https://gw.example.com/opencode`` 不应命中
+    # ``https://gw.example.com/opencode-evil.example``。
+    return normalized[len(prefix)] in "/?#"
 
 
 def normalize_headers(headers: Any) -> dict[str, str]:
@@ -213,6 +234,19 @@ def strip_session_prefix(value: str) -> str:
     if not text:
         return ""
     return _SESSION_PREFIX_PATTERN.sub("", text, count=1) or text
+
+
+def preview_seed(identifier: str) -> str:
+    """派生只读的种子预览值（不落盘），供排障工具展示。
+
+    Args:
+        identifier: 用于派生预览值的标识（通常为主机名）。
+
+    Returns:
+        str: 稳定的十六进制预览值。
+    """
+
+    return hashlib.sha256(f"preview|{identifier}".encode("utf-8")).hexdigest()
 
 
 def extract_session_seed(
@@ -367,6 +401,40 @@ class SessionSeedStore:
         self._seeds[normalized_key] = created
         self._persist()
         return created
+
+    def peek(self, key: str) -> str | None:
+        """只读查询已有种子；不存在时返回 ``None``（不创建、不落盘）。
+
+        Args:
+            key: 端点标识，通常为 ``provider|host``。
+
+        Returns:
+            str | None: 已有种子；不存在时为 ``None``。
+        """
+
+        self._load()
+        normalized_key = str(key or "").strip() or "default"
+        return self._seeds.get(normalized_key) or None
+
+    def peek_host(self, host: str) -> tuple[str, str] | None:
+        """只读查询任意以 ``|<host>`` 结尾的已有种子（不创建、不落盘）。
+
+        Args:
+            host: 主机名。
+
+        Returns:
+            tuple[str, str] | None: ``(键, 种子)``；无匹配项时为 ``None``。
+        """
+
+        normalized_host = str(host or "").strip().lower()
+        if not normalized_host:
+            return None
+        suffix = f"|{normalized_host}"
+        self._load()
+        for key in sorted(self._seeds):
+            if key.lower().endswith(suffix):
+                return key, self._seeds[key]
+        return None
 
     def rotate(self, key: str | None = None) -> str:
         """轮换指定键（或全部）的种子。

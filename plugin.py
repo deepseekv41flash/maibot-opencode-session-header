@@ -60,6 +60,7 @@ from .session_identity import (
     extract_session_seed,
     is_opencode_endpoint,
     normalize_base_url,
+    preview_seed,
     resolve_alphabet,
     strip_session_prefix,
 )
@@ -251,7 +252,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         handler_name="dispatch",
         name="OpenCode 会话头注入",
         description="转发 OpenAI 兼容请求，并在命中 opencode.ai 端点时注入稳定的 X-OpenCode-Session。",
-        version="1.1.2",
+        version="1.1.3",
     )
     async def dispatch(
         self,
@@ -438,13 +439,25 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         del kwargs
         config = self.config
         matched = self._endpoint_matched(base_url)
+        preview_note = ""
 
         if session_hint.strip():
             seed = SessionSeed(value=strip_session_prefix(session_hint), source="session_hint")
         else:
+            # 排障路径只读：不创建、不落盘，避免模型逐域名试探把种子文件撑大。
             store = self._seed_store_instance()
-            key = f"tool|{extract_host(base_url) or 'unknown'}"
-            seed = SessionSeed(value=store.get(key), source=f"fallback:{key}")
+            host = extract_host(base_url) or "unknown"
+            key = f"tool|{host}"
+            existing = store.peek(key)
+            provider_entry = store.peek_host(host) if existing is None else None
+            if existing is not None:
+                seed = SessionSeed(value=existing, source=f"fallback:{key}")
+            elif provider_entry is not None:
+                provider_key, provider_value = provider_entry
+                seed = SessionSeed(value=provider_value, source=f"fallback:{provider_key}")
+            else:
+                seed = SessionSeed(value=preview_seed(host), source=f"preview:{host}")
+                preview_note = "（该主机尚无兜底种子，此处为不落盘的只读预览值）"
 
         token = derive_session_token(
             seed.value,
@@ -455,7 +468,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         headers = {name: token for name in self._header_names()} if matched else {}
 
         if matched:
-            summary = f"{normalize_base_url(base_url) or '<空>'} 命中 OpenCode 端点，将注入 {headers}。"
+            summary = f"{normalize_base_url(base_url) or '<空>'} 命中 OpenCode 端点，将注入 {headers}。{preview_note}"
         else:
             summary = f"{normalize_base_url(base_url) or '<空>'} 未命中 OpenCode 端点，不会注入任何头。"
 
@@ -685,7 +698,11 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
 
         tool_options = request.get("tool_options") or []
         tools = build_chat_tools(tool_options)
-        messages = build_chat_messages(request.get("context_items") or [], has_tools=bool(tools))
+        wire_stats: dict[str, Any] = {}
+        messages = build_chat_messages(
+            request.get("context_items") or [], has_tools=bool(tools), stats=wire_stats
+        )
+        self._log_dropped_items(wire_stats, PROTOCOL_CHAT_COMPLETIONS)
 
         body: dict[str, Any] = {
             "model": str(model_info.get("model_identifier") or ""),
@@ -716,6 +733,23 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         body.update(self._collect_extra_body(request.get("extra_params"), _RESERVED_BODY_KEYS))
         return body
 
+    def _log_dropped_items(self, stats: Mapping[str, Any], protocol: str) -> None:
+        """未识别 Context Item 被丢弃时留一条日志，避免上下文静默缺块。
+
+        Args:
+            stats: 线格式投影写回的统计字典。
+            protocol: 当前线上协议名。
+        """
+
+        dropped = int(stats.get("dropped_items") or 0)
+        if dropped <= 0:
+            return
+        dropped_types = ", ".join(str(item) for item in (stats.get("dropped_types") or []))
+        self.ctx.logger.warning(
+            f"OpenCode 会话头注入: 线格式 {protocol} 丢弃了 {dropped} 个无法投影的 Context Item"
+            f"（类型：{dropped_types or '<空类型>'}）；通常意味着宿主新增了插件尚不认识的 Item 类型"
+        )
+
     def _build_responses_body(
         self,
         request: Mapping[str, Any],
@@ -733,7 +767,11 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
 
         tool_options = request.get("tool_options") or []
         tools = build_responses_tools(tool_options)
-        input_items = build_responses_input(request.get("context_items") or [], has_tools=bool(tools))
+        wire_stats: dict[str, Any] = {}
+        input_items = build_responses_input(
+            request.get("context_items") or [], has_tools=bool(tools), stats=wire_stats
+        )
+        self._log_dropped_items(wire_stats, PROTOCOL_RESPONSES)
 
         # 先铺扩展字段，再补规范字段，避免扩展字段覆盖关键结构。
         body: dict[str, Any] = {}

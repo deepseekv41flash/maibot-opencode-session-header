@@ -213,12 +213,14 @@ def build_chat_messages(
     context_items: Iterable[Any],
     *,
     has_tools: bool,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """把 Context Item 快照转换为 OpenAI ``messages``。
 
     Args:
         context_items: 快照中的 ``context_items`` 列表。
         has_tools: 本次请求是否携带工具定义；为 ``False`` 时清洗工具链。
+        stats: 可选统计字典；传入时写回 ``dropped_items`` / ``dropped_types``。
 
     Returns:
         list[dict[str, Any]]: OpenAI 兼容消息列表。
@@ -229,6 +231,8 @@ def build_chat_messages(
         items = [item for item in items if str(item.get("item_type") or "") not in _TOOL_CHAIN_TYPES]
 
     messages: list[dict[str, Any]] = []
+    dropped = 0
+    dropped_types: set[str] = set()
     index = 0
     while index < len(items):
         item = items[index]
@@ -271,10 +275,33 @@ def build_chat_messages(
                 messages.append(assistant_message)
             continue
 
-        # 未知识别不了的 Item：跳过而不是让整次请求失败。
+        # 未知识别不了的 Item：跳过而不是让整次请求失败，但要计数，
+        # 避免宿主新增 Item 类型时上下文悄悄缺块。
+        dropped += 1
+        dropped_types.add(item_type or "<空类型>")
         index += 1
 
+    _record_dropped(stats, dropped, dropped_types)
     return messages
+
+
+def _record_dropped(
+    stats: dict[str, Any] | None,
+    dropped: int,
+    dropped_types: set[str],
+) -> None:
+    """把「被丢弃的未识别 Item」统计写回调用方提供的字典。
+
+    Args:
+        stats: 调用方提供的统计字典；为 ``None`` 时不做任何事。
+        dropped: 被丢弃的 Item 数量。
+        dropped_types: 被丢弃的 Item 类型集合。
+    """
+
+    if stats is None:
+        return
+    stats["dropped_items"] = dropped
+    stats["dropped_types"] = sorted(dropped_types)
 
 
 def build_chat_tools(tool_options: Any) -> list[dict[str, Any]] | None:
@@ -582,6 +609,7 @@ def build_responses_input(
     context_items: Iterable[Any],
     *,
     has_tools: bool,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """把 Context Item 快照转换为 Responses ``input`` 列表。
 
@@ -591,6 +619,7 @@ def build_responses_input(
     Args:
         context_items: 快照中的 ``context_items`` 列表。
         has_tools: 本次请求是否携带工具定义；为 ``False`` 时清洗工具链。
+        stats: 可选统计字典；传入时写回 ``dropped_items`` / ``dropped_types``。
 
     Returns:
         list[dict[str, Any]]: Responses Input Items。
@@ -601,6 +630,8 @@ def build_responses_input(
         items = [item for item in items if str(item.get("item_type") or "") not in _TOOL_CHAIN_TYPES]
 
     input_items: list[dict[str, Any]] = []
+    dropped = 0
+    dropped_types: set[str] = set()
     for item in items:
         item_type = str(item.get("item_type") or "").strip()
         parts = [part for part in (item.get("parts") or []) if isinstance(part, Mapping)]
@@ -649,6 +680,10 @@ def build_responses_input(
             continue
 
         # reasoning / Provider 原生活动 / 未知 Item 在 Responses 侧没有可移植投影。
+        dropped += 1
+        dropped_types.add(item_type or "<空类型>")
+
+    _record_dropped(stats, dropped, dropped_types)
     return input_items
 
 

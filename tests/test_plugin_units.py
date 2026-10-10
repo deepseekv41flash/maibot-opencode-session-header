@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -27,11 +28,13 @@ from openai_wire import (  # noqa: E402
     parse_tool_arguments,
 )
 from session_identity import (  # noqa: E402
+    SessionSeedStore,
     derive_session_token,
     extract_host,
     extract_session_seed,
     is_opencode_endpoint,
     normalize_headers,
+    preview_seed,
     strip_session_prefix,
 )
 
@@ -432,6 +435,128 @@ class ResponsesWireTests(unittest.TestCase):
         assert usage is not None
         self.assertEqual(usage["prompt_tokens"], 10)
         self.assertNotIn("prompt_cache_hit_tokens", usage)
+
+
+class EndpointPrefixBoundaryTests(unittest.TestCase):
+    """``extra_base_url_prefixes`` 必须按路径段边界命中（v1.1.3 起）。"""
+
+    PREFIX = ["https://gw.example.com/opencode"]
+
+    def _match(self, url: str, prefixes: list[str]) -> bool:
+        return is_opencode_endpoint(url, host_suffixes=(), extra_base_url_prefixes=prefixes)
+
+    def test_exact_and_subpath_hit(self) -> None:
+        for url in (
+            "https://gw.example.com/opencode",
+            "https://gw.example.com/opencode/",
+            "https://gw.example.com/opencode/v1/chat/completions",
+            "https://gw.example.com/opencode?v=1",
+            "https://gw.example.com/opencode#frag",
+        ):
+            self.assertTrue(self._match(url, self.PREFIX), url)
+
+    def test_lookalike_paths_do_not_hit(self) -> None:
+        for url in (
+            "https://gw.example.com/opencode-evil.example/v1",
+            "https://gw.example.com/opencodeX",
+            "https://gw.example.com/opencode.evil.example",
+        ):
+            self.assertFalse(self._match(url, self.PREFIX), url)
+
+    def test_host_only_prefix_still_matches_subpaths(self) -> None:
+        self.assertTrue(self._match("https://gw.example.com/anything", ["https://gw.example.com"]))
+
+    def test_host_prefix_does_not_leak_to_lookalike_host(self) -> None:
+        self.assertFalse(self._match("https://gw.example.com.evil.test/v1", ["https://gw.example.com"]))
+
+
+class SeedStoreReadOnlyTests(unittest.TestCase):
+    """种子仓库的只读查询（v1.1.3 起排障工具路径不再落盘）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.path = Path(self._tmp.name) / "session_seeds.json"
+        self.store = SessionSeedStore(self.path)
+
+    def test_peek_does_not_create_file(self) -> None:
+        self.assertIsNone(self.store.peek("tool|gw.example.com"))
+        self.assertFalse(self.path.exists())
+
+    def test_peek_returns_existing_seed(self) -> None:
+        created = self.store.get("provider|gw.example.com")
+        self.assertTrue(self.path.exists())
+        self.assertEqual(self.store.peek("provider|gw.example.com"), created)
+
+    def test_peek_host_matches_provider_key(self) -> None:
+        created = self.store.get("provider|gw.example.com")
+        self.assertEqual(self.store.peek_host("gw.example.com"), ("provider|gw.example.com", created))
+        self.assertIsNone(self.store.peek_host("other.example.com"))
+        self.assertIsNone(self.store.peek_host(""))
+
+    def test_peek_paths_do_not_grow_store(self) -> None:
+        self.store.get("provider|a.example.com")
+        before = self.path.read_text(encoding="utf-8")
+        self.store.peek_host("b.example.com")
+        self.store.peek("tool|b.example.com")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+
+class PreviewSeedTests(unittest.TestCase):
+    """只读预览值（不落盘）。"""
+
+    def test_stable_and_distinct(self) -> None:
+        self.assertEqual(preview_seed("gw.example.com"), preview_seed("gw.example.com"))
+        self.assertNotEqual(preview_seed("gw.example.com"), preview_seed("other.example.com"))
+
+    def test_is_hex_digest(self) -> None:
+        value = preview_seed("gw.example.com")
+        self.assertEqual(len(value), 64)
+        int(value, 16)
+
+
+class DroppedItemStatsTests(unittest.TestCase):
+    """未识别 Context Item 的丢弃计数（v1.1.3 起）。"""
+
+    @staticmethod
+    def _item(item_type: str, **extra: object) -> dict:
+        return {"item_type": item_type, "meta": {"item_id": "i", "timestamp": "t"}, **extra}
+
+    def test_chat_counts_unknown_items(self) -> None:
+        items = [
+            self._item("SystemMessageItem", parts=[{"type": "text", "text": "s"}]),
+            self._item("BrandNewItem", parts=[{"type": "text", "text": "?"}]),
+            self._item("UserMessageItem", parts=[{"type": "text", "text": "u"}]),
+        ]
+        stats: dict = {}
+        messages = build_chat_messages(items, has_tools=False, stats=stats)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(stats["dropped_items"], 1)
+        self.assertEqual(stats["dropped_types"], ["BrandNewItem"])
+
+    def test_responses_counts_unknown_items(self) -> None:
+        items = [
+            self._item("UserMessageItem", parts=[{"type": "text", "text": "u"}]),
+            self._item("ReasoningItem"),
+            self._item("BrandNewItem"),
+        ]
+        stats: dict = {}
+        input_items = build_responses_input(items, has_tools=False, stats=stats)
+        self.assertEqual(len(input_items), 1)
+        self.assertEqual(stats["dropped_items"], 2)
+        self.assertEqual(stats["dropped_types"], ["BrandNewItem", "ReasoningItem"])
+
+    def test_no_drop_reports_zero(self) -> None:
+        items = [self._item("UserMessageItem", parts=[{"type": "text", "text": "u"}])]
+        stats: dict = {}
+        build_chat_messages(items, has_tools=False, stats=stats)
+        self.assertEqual(stats["dropped_items"], 0)
+        self.assertEqual(stats["dropped_types"], [])
+
+    def test_stats_is_optional(self) -> None:
+        items = [self._item("BrandNewItem")]
+        self.assertEqual(build_chat_messages(items, has_tools=True), [])
+        self.assertEqual(build_responses_input(items, has_tools=True), [])
 
 
 if __name__ == "__main__":
