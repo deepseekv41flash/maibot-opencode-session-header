@@ -251,7 +251,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         handler_name="dispatch",
         name="OpenCode 会话头注入",
         description="转发 OpenAI 兼容请求，并在命中 opencode.ai 端点时注入稳定的 X-OpenCode-Session。",
-        version="1.1.1",
+        version="1.1.2",
     )
     async def dispatch(
         self,
@@ -465,7 +465,6 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
             "content": f"{summary} 线上协议 {protocol}，端点 {path}。",
             "matched": matched,
             "headers": headers,
-            "seed_source": seed.source,
             "wire_protocol": protocol,
             "endpoint_path": path,
             "token_length": len(token),

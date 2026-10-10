@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "maibot.opencode-session-header",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "name": "OpenCode 会话头注入",
   "description": "自动识别 opencode.ai 端点并注入稳定的 X-OpenCode-Session 请求头，避免网关返回 400 MissingSessionID；支持 chat_completions 与 responses 两种协议，会话 ID 经 SHA-256 截断哈希，其他 Provider 不受影响。",
   "author": {
@@ -34,7 +34,7 @@
       "client_type": "opencode-session",
       "name": "OpenCode 会话头注入",
       "description": "转发 OpenAI 兼容请求，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
-      "version": "1.1.1"
+      "version": "1.1.2"
     }
   ],
   "capabilities": [

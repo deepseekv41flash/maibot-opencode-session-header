@@ -185,6 +185,11 @@ Responses 的结构化输出（`text.format`）。
 * `session_id_env` 只应填写会话标识类变量名。若填了持有密钥的变量名，出网的虽然仍是单向
   哈希、不可逆推，但种子的熵会来自该密钥的值；
 * `verbose` 日志会输出端点、种子来源与令牌本身，请按你所在部署的日志留存策略处理；
+* **重定向**：HTTP 传输沿用 httpx 的默认行为（`follow_redirects=True`）。当重定向目标与
+  原地址**不同源**（协议 / 主机 / 端口任一不同）时，httpx 会剥离标准 `Authorization` 头
+  （同主机 `http → https` 升级除外），但**不会剥离自定义鉴权头**——即 `auth_type = "header"`
+  时配置的 `auth_header_name` 会被带到重定向目标；`307` / `308` 还会把请求体重发到新主机。
+  因此请让自建 / 中转网关直接返回结果，不要做跨域重定向；
 * 插件只读取配置里的 URL 与请求头，不读取、不上报任何聊天内容。
 
 ## 8. 排障
@@ -263,16 +268,27 @@ opencode-session-header/
 | 项 | 值 |
 |---|---|
 | 插件 ID | `maibot.opencode-session-header` |
-| 版本 | `1.1.1` |
+| 版本 | `1.1.2` |
 | 作者 | deepseekv41flash |
 | 仓库 | https://github.com/deepseekv41flash/maibot-opencode-session-header |
 | 许可证 | MIT |
 
 插件市场按 **Release 版本**收录，Tag 与 `_manifest.json` 的 `version` 必须一致
-（`v1.1.1` ↔ `1.1.1`）。`host_application` / `sdk` 的上界按官方建议置于
+（`v1.1.2` ↔ `1.1.2`）。`host_application` / `sdk` 的上界按官方建议置于
 `999.999.999`，只认真约束 `min_version`。
 
 ## 12. 变更记录
+
+### 1.1.2
+
+* 变更：`opencode_session_token` 工具返回体移除 `seed_source` 字段，不再把部署细节
+  暴露给模型（`verbose` 日志中仍保留，便于排障）；
+* 文档：第 7 节补充重定向行为说明——跨域重定向时 httpx 会剥离标准 `Authorization` 头，
+  但不会剥离自定义鉴权头，且 `307` / `308` 会把请求体重发到新主机；
+* 版本号同步至 `1.1.2`（`_manifest.json` 与 `@LLMProvider` 的 `version`）。
+
+**兼容性**：工具返回体字段减少属向后兼容变更；HTTP 传输层与配置结构未改，
+`config_version` 保持 `1.1.0`。
 
 ### 1.1.1
 
