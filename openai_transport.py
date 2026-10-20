@@ -22,7 +22,7 @@ DEFAULT_CHAT_COMPLETIONS_PATH = "/chat/completions"
 #: Responses API 端点路径。
 RESPONSES_PATH = "/responses"
 
-#: 视为「该端点不存在」的状态码，用于 ``wire_protocol = auto`` 的协议回退。
+#: 视为「该端点不存在」的状态码，用于在错误信息里给出可读提示。
 UNSUPPORTED_ENDPOINT_STATUS = frozenset({404, 405, 501})
 
 
@@ -269,7 +269,11 @@ class JsonTransport:
             if "MissingSessionID" in text:
                 hint = "（网关要求会话头；请确认插件已启用且本模型的 client_type 指向本插件）"
             elif response.status_code in UNSUPPORTED_ENDPOINT_STATUS:
-                hint = f"（端点 {path} 可能不被该网关支持；可尝试切换 wire_protocol）"
+                hint = (
+                    f"（端点 {path} 可能不被该网关支持；"
+                    "可把该 API Provider 的 client_type 换成 opencode-session 或 "
+                    "opencode-session-responses 再试）"
+                )
             raise OpenCodeTransportError(
                 f"网关返回 HTTP {response.status_code}{hint}，响应片段: {excerpt or '<空>'}",
                 status_code=response.status_code,

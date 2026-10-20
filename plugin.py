@@ -10,7 +10,12 @@ MaiBot 的 OpenAI 兼容模型请求默认不带任何会话头，而 OpenCode �
 * 未命中时原样透传，不添加任何头，也不改变请求体 —— 其他 Provider 不受影响。
 
 注意：主程序不允许插件覆盖内置 ``client_type``，因此需要在模型配置里把
-OpenCode 的 API Provider 的 ``client_type`` 设为 ``opencode-session``。
+OpenCode 的 API Provider 的 ``client_type`` 设为下面二者之一：
+
+* ``opencode-session`` —— 走 ``POST /chat/completions``；
+* ``opencode-session-responses`` —— 走 ``POST /responses``。
+
+两者可以同时存在，因此不同模型可以分别使用两种协议。
 """
 
 from __future__ import annotations
@@ -34,7 +39,6 @@ from .openai_transport import (
     RESPONSES_PATH,
     JsonTransport,
     OpenCodeTransportError,
-    is_endpoint_unsupported,
 )
 from .openai_wire import (
     build_chat_messages,
@@ -66,7 +70,10 @@ from .session_identity import (
 )
 
 #: 本插件对外声明的 LLM Provider 客户端类型，需与 ``_manifest.json`` 保持一致。
-PROVIDER_CLIENT_TYPE = "opencode-session"
+#: Chat Completions 协议（历史名称，保持向后兼容）。
+PROVIDER_CLIENT_TYPE_CHAT = "opencode-session"
+#: Responses 协议。
+PROVIDER_CLIENT_TYPE_RESPONSES = "opencode-session-responses"
 
 #: 请求体中由本插件显式承载、不应再从 ``extra_params`` 平铺进来的字段。
 _RESERVED_BODY_KEYS = frozenset(
@@ -82,11 +89,21 @@ _RESPONSES_RESERVED_BODY_KEYS = _RESERVED_BODY_KEYS | {
     "text",
 }
 
-#: 支持的线上协议。
+#: 两种线上协议；由模型配置里选用的 client_type 决定，不再有全局开关。
 PROTOCOL_CHAT_COMPLETIONS = "chat_completions"
 PROTOCOL_RESPONSES = "responses"
-PROTOCOL_AUTO = "auto"
-_VALID_PROTOCOLS = frozenset({PROTOCOL_CHAT_COMPLETIONS, PROTOCOL_RESPONSES, PROTOCOL_AUTO})
+
+#: client_type → 线上协议。
+PROTOCOL_BY_CLIENT_TYPE: dict[str, str] = {
+    PROVIDER_CLIENT_TYPE_CHAT: PROTOCOL_CHAT_COMPLETIONS,
+    PROVIDER_CLIENT_TYPE_RESPONSES: PROTOCOL_RESPONSES,
+}
+
+#: 协议 → 端点路径。
+PATH_BY_PROTOCOL: dict[str, str] = {
+    PROTOCOL_CHAT_COMPLETIONS: DEFAULT_CHAT_COMPLETIONS_PATH,
+    PROTOCOL_RESPONSES: RESPONSES_PATH,
+}
 
 _COMMAND_PATTERN = r"^/(?:oc_session|opencode_session)\s*$"
 _COMMAND_RESET_PATTERN = r"^/(?:oc_session_reset|opencode_session_reset)\s*$"
@@ -103,7 +120,7 @@ class PluginSectionConfig(PluginConfigBase):
         default=True,
         description="是否注入会话头。关闭后请求照常转发，但不再添加任何头。",
     )
-    config_version: str = Field(default="1.1.0", description="配置版本")
+    config_version: str = Field(default="1.2.0", description="配置版本")
 
 
 class EndpointSectionConfig(PluginConfigBase):
@@ -170,24 +187,15 @@ class SessionHeaderSectionConfig(PluginConfigBase):
 
 
 class WireSectionConfig(PluginConfigBase):
-    """请求协议配置。"""
+    """Responses 协议参数（协议本身由 client_type 决定）。"""
 
-    __ui_label__ = "请求协议"
+    __ui_label__ = "Responses 协议"
     __ui_icon__ = "plug"
     __ui_order__ = 3
 
-    wire_protocol: str = Field(
-        default=PROTOCOL_CHAT_COMPLETIONS,
-        description=(
-            "chat_completions：POST /chat/completions；"
-            "responses：POST /responses；"
-            "auto：先用 chat_completions，端点不存在（404/405/501）时自动改用 responses。"
-        ),
-        json_schema_extra={"placeholder": "chat_completions"},
-    )
     responses_store: bool = Field(
         default=False,
-        description="仅 responses 协议使用：是否让网关保存响应（store）。默认 false。",
+        description="仅 opencode-session-responses 使用：是否让网关保存响应（store）。默认 false。",
     )
 
 
@@ -211,8 +219,6 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         super().__init__()
         self._transport = JsonTransport()
         self._seed_store: SessionSeedStore | None = None
-        #: ``wire_protocol = auto`` 时记住「该端点只支持 responses」的结论。
-        self._protocol_overrides: dict[str, str] = {}
 
     # ── 生命周期 ────────────────────────────────────────────────
 
@@ -224,7 +230,8 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
             f"OpenCode 会话头注入插件已加载：匹配域名 [{suffix_text}]，"
             f"注入头 {self.config.session_header.header_name}，"
             f"令牌长度 {clamp_token_length(self.config.session_header.token_length)}，"
-            f"线上协议 {self._configured_protocol()}"
+            f"客户端类型 {PROVIDER_CLIENT_TYPE_CHAT}={PROTOCOL_CHAT_COMPLETIONS}、"
+            f"{PROVIDER_CLIENT_TYPE_RESPONSES}={PROTOCOL_RESPONSES}"
         )
 
     async def on_unload(self) -> None:
@@ -248,19 +255,19 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
     # ── LLM Provider ───────────────────────────────────────────
 
     @LLMProvider(
-        PROVIDER_CLIENT_TYPE,
-        handler_name="dispatch",
-        name="OpenCode 会话头注入",
-        description="转发 OpenAI 兼容请求，并在命中 opencode.ai 端点时注入稳定的 X-OpenCode-Session。",
-        version="1.1.3",
+        PROVIDER_CLIENT_TYPE_CHAT,
+        handler_name="dispatch_chat",
+        name="OpenCode 会话头注入（Chat Completions）",
+        description="转发 POST /chat/completions，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
+        version="1.2.0",
     )
-    async def dispatch(
+    async def dispatch_chat(
         self,
         operation: str = "",
         request: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """按操作类型分发宿主请求。
+        """Chat Completions 协议的 Provider 入口。
 
         Args:
             operation: 操作类型，目前仅支持 ``response``。
@@ -275,15 +282,73 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         """
 
         del kwargs
+        return await self._serve(PROTOCOL_CHAT_COMPLETIONS, operation, request)
+
+    @LLMProvider(
+        PROVIDER_CLIENT_TYPE_RESPONSES,
+        handler_name="dispatch_responses",
+        name="OpenCode 会话头注入（Responses）",
+        description="转发 POST /responses，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
+        version="1.2.0",
+    )
+    async def dispatch_responses(
+        self,
+        operation: str = "",
+        request: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Responses 协议的 Provider 入口。
+
+        Args:
+            operation: 操作类型，目前仅支持 ``response``。
+            request: 宿主序列化后的 LLM 请求。
+            **kwargs: 预留的额外参数。
+
+        Returns:
+            dict[str, Any]: 可由宿主恢复为 APIResponse 的响应字典。
+
+        Raises:
+            ValueError: 操作类型不受支持时抛出。
+        """
+
+        del kwargs
+        return await self._serve(PROTOCOL_RESPONSES, operation, request)
+
+    async def _serve(
+        self,
+        protocol: str,
+        operation: str,
+        request: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """校验操作类型后转交 :meth:`get_response`。
+
+        Args:
+            protocol: 本次使用的线上协议。
+            operation: 操作类型。
+            request: 宿主序列化后的 LLM 请求。
+
+        Returns:
+            dict[str, Any]: 响应字典。
+
+        Raises:
+            ValueError: 操作类型不受支持时抛出。
+        """
+
         if operation != "response":
             raise ValueError(f"OpenCode 会话头注入 Provider 暂不支持操作类型: {operation!r}")
-        return await self.get_response(dict(request or {}))
+        return await self.get_response(dict(request or {}), protocol=protocol)
 
-    async def get_response(self, request: dict[str, Any]) -> dict[str, Any]:
-        """按配置的线上协议转发一次请求，并按需注入会话头。
+    async def get_response(
+        self,
+        request: dict[str, Any],
+        *,
+        protocol: str = PROTOCOL_CHAT_COMPLETIONS,
+    ) -> dict[str, Any]:
+        """按指定协议转发一次请求，并按需注入会话头。
 
         Args:
             request: 宿主序列化后的响应请求。
+            protocol: 线上协议，由调用方选用的 client_type 决定。
 
         Returns:
             dict[str, Any]: 响应字典，包含 ``content`` / ``reasoning_content`` / ``tool_calls`` / ``usage``。
@@ -313,10 +378,8 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
                 injected[header_name] = token
 
         timeout_seconds = self._resolve_timeout(api_provider)
-        protocol = self._resolve_protocol(base_url)
         path, body = self._build_protocol_request(protocol, request, model_info)
 
-        fallback_note = ""
         try:
             transport_result = await self._transport.post_json(
                 base_url=base_url,
@@ -327,32 +390,12 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
                 path=path,
             )
         except OpenCodeTransportError as exc:
-            fallback_protocol = self._fallback_protocol(protocol, exc, base_url)
-            if fallback_protocol is None:
-                raise RuntimeError(f"OpenCode 会话头注入 Provider 请求失败: {exc}") from exc
-            self.ctx.logger.warning(
-                f"OpenCode 会话头注入: 端点 {path} 不可用（{exc.status_code}），"
-                f"自动改用 {fallback_protocol} 重试"
-            )
-            fallback_note = f" fallback={protocol}->{fallback_protocol}"
-            protocol = fallback_protocol
-            path, body = self._build_protocol_request(protocol, request, model_info)
-            try:
-                transport_result = await self._transport.post_json(
-                    base_url=base_url,
-                    body=body,
-                    api_provider=api_provider,
-                    injected_headers=injected,
-                    timeout_seconds=timeout_seconds,
-                    path=path,
-                )
-            except OpenCodeTransportError as retry_exc:
-                raise RuntimeError(f"OpenCode 会话头注入 Provider 请求失败: {retry_exc}") from retry_exc
+            raise RuntimeError(f"OpenCode 会话头注入 Provider 请求失败: {exc}") from exc
 
         if config.session_header.verbose:
             self.ctx.logger.info(
                 "OpenCode 会话头注入: "
-                f"endpoint={transport_result.endpoint} protocol={protocol}{fallback_note} matched={matched} "
+                f"endpoint={transport_result.endpoint} protocol={protocol} matched={matched} "
                 f"injected={sorted(injected)} seed_source={seed.source if seed else '<未解析>'} "
                 f"status={transport_result.status_code} latency={transport_result.latency_ms}ms"
             )
@@ -417,12 +460,19 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
                 description="可选：模拟的会话值（如 Session-Id），留空则使用兜底种子",
                 required=False,
             ),
+            ToolParameterInfo(
+                name="client_type",
+                param_type=ToolParamType.STRING,
+                description="可选：要预览的客户端类型，opencode-session（chat）或 opencode-session-responses",
+                required=False,
+            ),
         ],
     )
     async def opencode_session_token(
         self,
         base_url: str = "",
         session_hint: str = "",
+        client_type: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
         """计算指定 Base URL 的注入结果。
@@ -430,6 +480,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         Args:
             base_url: 待检查的 Base URL。
             session_hint: 可选的模拟会话值。
+            client_type: 可选，要预览的客户端类型；留空按 chat 预览。
             **kwargs: 宿主传入的额外参数。
 
         Returns:
@@ -472,12 +523,19 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         else:
             summary = f"{normalize_base_url(base_url) or '<空>'} 未命中 OpenCode 端点，不会注入任何头。"
 
-        protocol = self._resolve_protocol(base_url)
-        path = RESPONSES_PATH if protocol == PROTOCOL_RESPONSES else DEFAULT_CHAT_COMPLETIONS_PATH
+        selected = str(client_type or "").strip()
+        protocol = PROTOCOL_BY_CLIENT_TYPE.get(selected, PROTOCOL_CHAT_COMPLETIONS)
+        path = PATH_BY_PROTOCOL[protocol]
         return {
-            "content": f"{summary} 线上协议 {protocol}，端点 {path}。",
+            "content": (
+                f"{summary} 当前预览协议 {protocol}，端点 {path}。"
+                f"两个 client_type 分别是：{PROVIDER_CLIENT_TYPE_CHAT} → /chat/completions，"
+                f"{PROVIDER_CLIENT_TYPE_RESPONSES} → /responses。"
+            ),
             "matched": matched,
             "headers": headers,
+            "client_types": dict(PROTOCOL_BY_CLIENT_TYPE),
+            "preview_client_type": selected or PROVIDER_CLIENT_TYPE_CHAT,
             "wire_protocol": protocol,
             "endpoint_path": path,
             "token_length": len(token),
@@ -594,69 +652,6 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
             return float(api_provider.get("timeout") or 120)
         except (TypeError, ValueError):
             return 120.0
-
-    # ── 协议选择 ────────────────────────────────────────────────
-
-    def _configured_protocol(self) -> str:
-        """返回配置中的线上协议。
-
-        Returns:
-            str: ``chat_completions`` / ``responses`` / ``auto`` 之一；非法值回退为 ``chat_completions``。
-        """
-
-        configured = str(self.config.wire.wire_protocol or PROTOCOL_CHAT_COMPLETIONS).strip().lower()
-        return configured if configured in _VALID_PROTOCOLS else PROTOCOL_CHAT_COMPLETIONS
-
-    def _endpoint_key(self, base_url: str) -> str:
-        """返回用于记忆协议回退结论的端点键。
-
-        Args:
-            base_url: 当前 Base URL。
-
-        Returns:
-            str: 端点键。
-        """
-
-        return f"{extract_host(base_url) or 'unknown'}|{normalize_base_url(base_url)}"
-
-    def _resolve_protocol(self, base_url: str) -> str:
-        """解析本次请求应使用的线上协议。
-
-        ``auto`` 模式默认走 chat_completions，只有在本端点被确认不支持该端点后
-        才改用 responses（结论按端点记忆，避免每次都多打一次 404）。
-
-        Args:
-            base_url: 当前 Base URL。
-
-        Returns:
-            str: 实际使用的协议。
-        """
-
-        configured = self._configured_protocol()
-        if configured != PROTOCOL_AUTO:
-            return configured
-        return self._protocol_overrides.get(self._endpoint_key(base_url), PROTOCOL_CHAT_COMPLETIONS)
-
-    def _fallback_protocol(self, protocol: str, error: BaseException, base_url: str) -> str | None:
-        """判断是否需要回退到另一种协议。
-
-        Args:
-            protocol: 刚失败的协议。
-            error: 传输异常。
-            base_url: 当前 Base URL。
-
-        Returns:
-            str | None: 需要回退时返回目标协议，否则返回 ``None``。
-        """
-
-        if self._configured_protocol() != PROTOCOL_AUTO:
-            return None
-        if protocol != PROTOCOL_CHAT_COMPLETIONS:
-            return None
-        if not is_endpoint_unsupported(error):
-            return None
-        self._protocol_overrides[self._endpoint_key(base_url)] = PROTOCOL_RESPONSES
-        return PROTOCOL_RESPONSES
 
     def _build_protocol_request(
         self,
@@ -981,9 +976,9 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
             f"令牌长度：{clamp_token_length(config.session_header.token_length)}"
             f"（字符集：{config.session_header.token_alphabet or 'alphanumeric'}，"
             f"实际字符数 {len(resolve_alphabet(config.session_header.token_alphabet))}）",
-            f"线上协议：{self._configured_protocol()}"
-            f"（chat_completions 或 responses；auto 会在端点不支持时自动改用 responses）",
-            f"Provider 类型：{PROVIDER_CLIENT_TYPE}（请在模型配置的 API Provider 中选用）",
+            "客户端类型（在模型配置的 API Provider 里二选一）：",
+            f"  · {PROVIDER_CLIENT_TYPE_CHAT} → POST /chat/completions",
+            f"  · {PROVIDER_CLIENT_TYPE_RESPONSES} → POST /responses",
         ]
 
         if snapshot:

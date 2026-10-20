@@ -28,12 +28,15 @@ MaiBot 允许插件注册自己的 **LLM Provider**（对应模型配置里的 `
 这是插件唯一能影响出网请求的官方扩展点（内置 `client_type` 不允许被插件覆盖）。
 本插件因此：
 
-1. 注册 `client_type = "opencode-session"` 的 Provider，接管指向它的模型请求；
+1. 注册**两个** Provider：`opencode-session`（chat_completions）与
+   `opencode-session-responses`（responses），各自接管指向自己的模型请求；
 2. 读取本次请求的 `api_provider.base_url`，判断是否命中 `opencode.ai`（含子域）；
 3. 命中时按优先级解析会话种子，做 SHA-256 截断哈希，注入会话头；
 4. 未命中时**不添加任何请求头**，请求体原样转发 —— 与内置客户端行为一致；
-5. 按 `[wire].wire_protocol` 选择线上协议（`/chat/completions` 或 `/responses`），
-   并把网关响应还原成宿主可消费的结构（正文 / 推理内容 / 工具调用 / usage）。
+5. 把网关响应还原成宿主可消费的结构（正文 / 推理内容 / 工具调用 / usage）。
+
+线上协议由你选用的 `client_type` 决定，**不再有全局协议开关**，因此两种协议
+可以同时使用（见 5.1）。
 
 > 只影响你把 `client_type` 指向本插件的那些模型。使用内置 `openai`、
 > `openai_responses`、`gemini` 的模型、以及其他 Provider，一条请求都不会被改动。
@@ -50,11 +53,15 @@ MaiBot 允许插件注册自己的 **LLM Provider**（对应模型配置里的 `
 
 ## 4. 关键一步：把模型指向本插件
 
-插件注册的 `client_type` 是 `opencode-session`。**必须**把它填到 opencode 服务商上，
-插件才会生效。两种方式：
+插件提供两种 `client_type`，**必须**把它们之一填到 opencode 服务商上，插件才会生效：
+
+| `client_type` | 走哪个端点 |
+|---|---|
+| `opencode-session` | `POST {base_url}/chat/completions` |
+| `opencode-session-responses` | `POST {base_url}/responses` |
 
 **WebUI（推荐）**：设置 → 模型 → 编辑 opencode 的 API 服务商 →
-「客户端类型」选择 `opencode-session`。
+「客户端类型」选择上表中的一个。
 
 **手改 `config/model_config.toml`**：
 
@@ -66,7 +73,7 @@ api_key = "sk-..."          # 你自己的密钥
 client_type = "opencode-session"   # ← 关键：默认是 "openai"
 ```
 
-保存后重启或热重载模型配置即可。
+保存后重启或热重载模型配置即可。想让不同模型分别使用两种协议，见 5.1。
 
 > 改回 `openai` 就等于停用注入（插件不再参与该服务商的任何请求）。
 
@@ -118,21 +125,66 @@ thread-id, x-thread-id, chat-id, x-chat-id
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `wire_protocol` | `"chat_completions"` | `chat_completions` / `responses` / `auto`，见下 |
-| `responses_store` | `false` | 仅 `responses` 协议：是否让网关保存响应（`store`） |
+| `responses_store` | `false` | 仅 `opencode-session-responses` 使用：是否让网关保存响应（`store`） |
 
-## 5.1 协议选择（chat_completions / responses）
+> 1.2.0 起移除了 `wire_protocol`：协议改由 `client_type` 决定，不再有全局开关。
 
-插件能用两种线上协议把请求送到网关，**端点识别与会话头注入逻辑完全一致**，只有请求/响应
-的线格式不同：
+## 5.1 两个客户端类型（协议由 client_type 决定）
 
-| `wire_protocol` | 端点 | 行为 |
+插件注册了**两个**独立的 LLM Provider。协议不再由全局开关切换，而由你在模型配置里
+选用的 `client_type` 决定：
+
+| `client_type` | 端点 | 备注 |
 |---|---|---|
-| `chat_completions`（默认） | `POST {base_url}/chat/completions` | 明确使用 Chat Completions |
-| `responses` | `POST {base_url}/responses` | 明确使用 Responses API |
-| `auto` | 先 chat，失败再 responses | 端点返回 404/405/501 时自动改用 responses，并按端点记住结论，后续不再重复试错 |
+| `opencode-session` | `POST {base_url}/chat/completions` | 历史名称，向后兼容 |
+| `opencode-session-responses` | `POST {base_url}/responses` | Responses API |
 
-实测 `opencode.ai/zen/go/v1` **两个端点都支持**，所以默认值就够用：
+两者**可以同时启用**：同一台机器人上，一部分模型走 chat、另一部分走 responses。
+
+### 怎么让两种协议并存
+
+`client_type` 挂在 **API Provider** 上，而模型通过 `api_provider` 引用服务商。
+所以要并存，需要建**两个 API Provider**（`base_url` / `api_key` 相同，只有 `name`
+与 `client_type` 不同）：
+
+```toml
+[[api_providers]]
+name = "opencode"                  # 给 chat 协议用
+base_url = "https://opencode.ai/zen/go/v1"
+api_key = "sk-..."
+client_type = "opencode-session"
+
+[[api_providers]]
+name = "opencode-responses"        # 给 responses 协议用
+base_url = "https://opencode.ai/zen/go/v1"
+api_key = "sk-..."
+client_type = "opencode-session-responses"
+```
+
+再让不同模型分别引用它们：
+
+```toml
+[[models]]
+model_identifier = "deepseek-v4.1-flash"
+name = "deepseek-v4.1-flash"
+api_provider = "opencode"                   # → /chat/completions
+
+[[models]]
+model_identifier = "some-responses-model"
+name = "some-responses-model"
+api_provider = "opencode-responses"         # → /responses
+```
+
+WebUI 同理：复制一份 API 服务商，改个名字并选对应的客户端类型。
+
+### 令牌行为
+
+令牌种子按 `服务商名|主机` 生成。上面两个服务商名字不同，因此各自持有一枚**独立的稳定令牌**，
+互不影响。两个 `client_type` 的端点识别、种子解析、哈希注入逻辑完全一致。
+
+### 选哪个
+
+实测 `opencode.ai/zen/go/v1` 两个端点都存在：
 
 ```
 POST /zen/go/v1/chat/completions -> 401 AuthError: Missing API key.
@@ -141,35 +193,35 @@ POST /zen/go/v1/responses        -> 401 AuthError: Missing API key.
 
 （无鉴权探测；返回 AuthError 而非 404，说明路由与模型都被接受。）
 
-**什么时候该选 `responses`**：你的中转网关只实现了 `/responses`，或者你确实需要
-Responses 的结构化输出（`text.format`）。
+**默认建议 `opencode-session`（chat）**，它与内置客户端行为最接近。
+只有当中转网关只实现 `/responses`、或你确实需要 Responses 的结构化输出（`text.format`）时，
+才给对应模型单独挂 `opencode-session-responses`。
 
-**选 `responses` 时与内置客户端的差异**：主程序内置的 responses 客户端依赖
-**provider replay fragment** 把推理项原样回传（`_can_replay_item()` 会校验 client_type、
-端点指纹与模型名），插件这条路拿不到 replay —— `serialize_context_item_snapshot()`
-明确不把 replay 放进快照，宿主反序列化时也不会还原。因此插件在 responses 模式下
-**直接省略 reasoning 项**，只发 `function_call` + `function_call_output`。
+### responses 模式与内置客户端的差异
 
-这带来的实际影响比想象中小：
+主程序内置的 responses 客户端依赖 **provider replay fragment** 把推理项原样回传
+（`_can_replay_item()` 会校验 client_type、端点指纹与模型名）。插件这条路拿不到 replay ——
+`serialize_context_item_snapshot()` 明确不把 replay 放进快照，宿主反序列化时也不会还原。
+因此插件在 responses 模式下**直接省略 reasoning 项**，只发 `function_call` +
+`function_call_output`。
+
+实际影响比想象中小：
 
 * 单轮问答、普通工具调用：**没有区别**；
 * 多轮工具循环：丢掉的是**跨轮次的推理连续性**（质量层面），不是报错。
   已知会真报错的是另外两种写法 —— 回传 `rs_...` ID（`store=false` 下报
   `Item with id ... not found`）或回传残缺的 reasoning 项（报
-  `reasoning was provided without its required following item`）。
-  插件两种都不做，所以**不会因为这一项被网关拒绝**；
-* 主程序内置客户端在 replay 作用域不匹配（换了 Provider / 端点 / 模型）时，
-  走的也是同样的「丢弃 reasoning」降级路径。
-
-结论保持不变：**没有特殊需求就用默认的 `chat_completions`**，那是零差异的路径。
+  `reasoning was provided without its required following item`）。插件两种都不做，
+  所以**不会因为这一项被网关拒绝**；
+* 主程序内置客户端在 replay 作用域不匹配时，走的也是同样的「丢弃 reasoning」降级路径。
 
 ## 6. 命令与工具
 
 | 类型 | 名称 | 用途 |
 |---|---|---|
-| 命令 | `/opencode_session`（别名 `/oc_session`） | 查看注入开关、匹配域名、当前协议、令牌预览 |
+| 命令 | `/opencode_session`（别名 `/oc_session`） | 查看注入开关、匹配域名、两个客户端类型、令牌预览 |
 | 命令 | `/opencode_session_reset`（别名 `/oc_session_reset`） | 清空兜底种子，下次请求重新生成 |
-| 工具 | `opencode_session_token` | 让模型计算某个 Base URL 会用哪个协议、注入什么头，用于排障 |
+| 工具 | `opencode_session_token` | 让模型计算某个 Base URL / 客户端类型会注入什么头，用于排障 |
 
 ## 7. 隐私说明
 
@@ -197,8 +249,10 @@ Responses 的结构化输出（`text.format`）。
 ## 8. 排障
 
 **仍然 400 MissingSessionID**
-1. 确认该 API 服务商的 `client_type` 已是 `opencode-session`（见第 4 节）；
-2. 打开 `[session_header].verbose`，看日志里是否出现 `OpenCode 会话头注入: ... matched=True`；
+1. 确认该 API 服务商的 `client_type` 是 `opencode-session` 或 `opencode-session-responses`
+   （见第 4 节）；`openai` 等内置类型不会触发本插件；
+2. 打开 `[session_header].verbose`，看日志里是否出现
+   `OpenCode 会话头注入: ... protocol=... matched=True`；
 3. 用 `/opencode_session` 确认注入开关为「开启」、域名列表包含 `opencode.ai`；
 4. 若是自建/中转网关，把地址前缀加进 `endpoint.extra_base_url_prefixes`。
 
@@ -229,9 +283,9 @@ print('OK', m.id, m.version) if m else print('FAIL', v.errors)"
 * 宿主发送的是「Context Item」快照，插件按主程序规则投影成 `messages`（或 Responses 的
   `input`）；遇到未知 Item 类型会跳过而不是让请求失败，同时按数量与类型记一条 warning，
   避免上下文静默缺块；
-* `responses` 协议下拿不到 provider replay fragment，插件会省略 reasoning 项，
-  影响是跨工具轮次的推理连续性（质量层面），不会因此被网关拒绝，
-  详见第 5.1 节。没有特殊需求请使用默认的 `chat_completions`。
+* `opencode-session-responses`（responses 协议）下拿不到 provider replay fragment，
+  插件会省略 reasoning 项，影响是跨工具轮次的推理连续性（质量层面），不会因此被网关拒绝，
+  详见第 5.1 节。没有特殊需求请让模型继续使用 `opencode-session`（chat）。
 
 ## 10. 开发与测试
 
@@ -281,6 +335,23 @@ opencode-session-header/
 `999.999.999`，只认真约束 `min_version`。
 
 ## 12. 变更记录
+
+### 1.2.0
+
+* **新功能**：把线上协议拆成两个独立的 `client_type` ——
+  `opencode-session` 走 `POST /chat/completions`，`opencode-session-responses` 走
+  `POST /responses`。两者可同时注册，因此同一台机器人上不同模型可以分别使用两种协议；
+* **配置变更**：移除 `[wire].wire_protocol`（含 `auto` 自动回退）。协议改由 `client_type`
+  决定，不再需要全局开关；`[wire]` 只剩 `responses_store`；
+* 两个 client_type 共用同一套端点识别、种子解析与哈希注入逻辑；令牌种子仍按
+  `服务商名|主机` 生成，因此并存的两个服务商各持一枚独立稳定令牌；
+* `opencode_session_token` 工具新增可选参数 `client_type`，并回报两个 client_type 的映射；
+* `config_version` 提升至 `1.2.0`，旧配置会自动迁移（补 `responses_store`、移除
+  `wire_protocol`）。
+
+**迁移注意**：如果你的 `wire_protocol` 原来是 `responses`（或 `auto` 且已回退到 responses），
+升级后该服务商默认回到 chat_completions。要保留 responses，请再建一个 API Provider，
+把它的 `client_type` 设为 `opencode-session-responses`（见 5.1）。
 
 ### 1.1.3
 
