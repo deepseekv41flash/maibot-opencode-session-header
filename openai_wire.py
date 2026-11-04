@@ -27,6 +27,16 @@ _ASSISTANT_GROUP_TYPES = frozenset(
 #: 无工具请求时需要清洗掉的 Item 类型（部分兼容接口拒收悬空的工具链）。
 _TOOL_CHAIN_TYPES = frozenset({"FunctionCallItem", "FunctionCallOutputItem"})
 
+#: 宿主已知、但按设计没有可移植投影的 Item 类型。
+#: 它们在协议转换时必然被跳过，属于预期行为，不应当作「未知类型」告警。
+_UNPROJECTABLE_ITEM_TYPES = frozenset(
+    {
+        "ReasoningItem",
+        "ProviderActivityItem",
+        "ProviderOpaqueItem",
+    }
+)
+
 _JSON_FENCE_PATTERN = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
 
@@ -233,6 +243,8 @@ def build_chat_messages(
     messages: list[dict[str, Any]] = []
     dropped = 0
     dropped_types: set[str] = set()
+    unprojectable = 0
+    unprojectable_types: set[str] = set()
     index = 0
     while index < len(items):
         item = items[index]
@@ -275,13 +287,17 @@ def build_chat_messages(
                 messages.append(assistant_message)
             continue
 
-        # 未知识别不了的 Item：跳过而不是让整次请求失败，但要计数，
-        # 避免宿主新增 Item 类型时上下文悄悄缺块。
-        dropped += 1
-        dropped_types.add(item_type or "<空类型>")
+        # 无法投影的 Item：跳过而不是让整次请求失败。分类计数——
+        # 宿主已知且按设计不可投影的类型不算异常，只有真正未知的类型才需要告警。
+        if item_type in _UNPROJECTABLE_ITEM_TYPES:
+            unprojectable += 1
+            unprojectable_types.add(item_type)
+        else:
+            dropped += 1
+            dropped_types.add(item_type or "<空类型>")
         index += 1
 
-    _record_dropped(stats, dropped, dropped_types)
+    _record_dropped(stats, dropped, dropped_types, unprojectable, unprojectable_types)
     return messages
 
 
@@ -289,19 +305,28 @@ def _record_dropped(
     stats: dict[str, Any] | None,
     dropped: int,
     dropped_types: set[str],
+    unprojectable: int = 0,
+    unprojectable_types: set[str] | None = None,
 ) -> None:
-    """把「被丢弃的未识别 Item」统计写回调用方提供的字典。
+    """把「被跳过的 Item」统计写回调用方提供的字典。
+
+    分两类写回：``dropped_*`` 是真正无法识别、需要关注的类型；
+    ``unprojectable_*`` 是宿主已知、但按设计没有可移植投影的类型（预期行为）。
 
     Args:
         stats: 调用方提供的统计字典；为 ``None`` 时不做任何事。
-        dropped: 被丢弃的 Item 数量。
-        dropped_types: 被丢弃的 Item 类型集合。
+        dropped: 无法识别的 Item 数量。
+        dropped_types: 无法识别的 Item 类型集合。
+        unprojectable: 按设计不可投影的 Item 数量。
+        unprojectable_types: 按设计不可投影的 Item 类型集合。
     """
 
     if stats is None:
         return
     stats["dropped_items"] = dropped
     stats["dropped_types"] = sorted(dropped_types)
+    stats["unprojectable_items"] = unprojectable
+    stats["unprojectable_types"] = sorted(unprojectable_types or set())
 
 
 def build_chat_tools(tool_options: Any) -> list[dict[str, Any]] | None:
@@ -632,6 +657,8 @@ def build_responses_input(
     input_items: list[dict[str, Any]] = []
     dropped = 0
     dropped_types: set[str] = set()
+    unprojectable = 0
+    unprojectable_types: set[str] = set()
     for item in items:
         item_type = str(item.get("item_type") or "").strip()
         parts = [part for part in (item.get("parts") or []) if isinstance(part, Mapping)]
@@ -680,10 +707,15 @@ def build_responses_input(
             continue
 
         # reasoning / Provider 原生活动 / 未知 Item 在 Responses 侧没有可移植投影。
-        dropped += 1
-        dropped_types.add(item_type or "<空类型>")
+        # 前者属于设计内行为，只统计不告警；后者才是需要关注的未知类型。
+        if item_type in _UNPROJECTABLE_ITEM_TYPES:
+            unprojectable += 1
+            unprojectable_types.add(item_type)
+        else:
+            dropped += 1
+            dropped_types.add(item_type or "<空类型>")
 
-    _record_dropped(stats, dropped, dropped_types)
+    _record_dropped(stats, dropped, dropped_types, unprojectable, unprojectable_types)
     return input_items
 
 

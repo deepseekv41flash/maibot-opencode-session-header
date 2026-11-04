@@ -79,8 +79,8 @@ client_type = "opencode-session"   # ← 关键：默认是 "openai"
 
 ## 5. 配置项（WebUI 可编辑，热重载生效）
 
-> 从 1.1.0 起新增 `[wire]` 配置节。旧版 `config.toml` 会在插件加载时**自动迁移**：
-> Runner 用「补充缺失键」的方式合并默认值，保留你手写的注释与原值。
+> 旧版 `config.toml` 会在插件加载时**自动迁移**：Runner 用「补充缺失键」的方式合并
+> 默认值、丢弃已移除的键，并保留你手写的注释与原值。1.3.0 已移除 `[wire]` 配置节。
 
 ### `[plugin]`
 
@@ -121,13 +121,42 @@ thread-id, x-thread-id, chat-id, x-chat-id
 都没有时依次回退到 `session_id_env` 环境变量、最后是插件数据目录中的持久化随机种子
 （`data/plugins/maibot.opencode-session-header/session_seeds.json`）。
 
-### `[wire]`
+### `[transport]` · 连接池与分相超时
+
+非流式思考模型单请求可占用连接数十秒；池一旦被占满、又用同一个超时值等 `read`，
+就会表现为「请求超时 120s」，但**请求其实根本没发出去**（见
+[issue #1](https://github.com/deepseekv41flash/maibot-opencode-session-header/issues/1)）。
+所以超时按阶段拆分，且连接池可配：
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
-| `responses_store` | `false` | 仅 `opencode-session-responses` 使用：是否让网关保存响应（`store`） |
+| `max_connections` | `64` | 连接池上限。1.4.0 起从 32 提到 64 |
+| `max_keepalive_connections` | `32` | 保活连接数（原 16） |
+| `connect_timeout` | `10.0` | 建连超时（秒） |
+| `write_timeout` | `30.0` | 发送请求体超时（秒） |
+| `pool_timeout` | `10.0` | **连接池排队超时（秒）**，池满时快速失败 |
+| `read_timeout_ratio` | `0.9` | read 超时 = Provider `timeout` × 本比例 |
+| `trust_env` | `true` | 是否读系统 `HTTP(S)_PROXY`；怀疑代理卡死连接池时设 `false` |
 
-> 1.2.0 起移除了 `wire_protocol`：协议改由 `client_type` 决定，不再有全局开关。
+两个要点：
+
+* **`pool_timeout` 必须远小于 read 超时**。池满时会在 10 秒内报
+  「本地连接池排队超时」并说明原因，而不是挂 120 秒后伪装成网关超时；
+* **`read_timeout_ratio` 默认 0.9**：宿主的 RPC 超时等于 Provider `timeout`，
+  若 read 也用同一个值，插件会被宿主先掐断，只能看到不可读的 `[E_TIMEOUT]`。
+  取 0.9 留出余量（120s → read 108s），插件才能返回可读错误。
+
+### 关于 `store`（已固定为 `false`，不可配置）
+
+插件在 responses 模式下**始终发送 `store: false`**，且不接受配置覆盖：
+
+* OpenCode 网关不是原生 Responses 目标，无法持久化响应；开启 `store` 会让请求直接
+  返回 `503 Endpoint is unavailable`（实测可导致连续 26 小时全部失败）；
+* 插件并不发送 `previous_response_id`，即使网关存了也不会取回，只会带来额外的
+  服务端留存（OpenAI 默认 30 天）；
+* 主程序内置的 `openai_responses` 客户端同样强制 `store=false`。
+
+1.2.0 曾把 `store` 暴露为 `[wire].responses_store`，1.3.0 已移除该配置节。
 
 ## 5.1 两个客户端类型（协议由 client_type 决定）
 
@@ -256,6 +285,15 @@ POST /zen/go/v1/responses        -> 401 AuthError: Missing API key.
 3. 用 `/opencode_session` 确认注入开关为「开启」、域名列表包含 `opencode.ai`；
 4. 若是自建/中转网关，把地址前缀加进 `endpoint.extra_base_url_prefixes`。
 
+**日志出现「本地连接池排队超时」**
+
+说明请求在本地连接池里排队超时，**根本没有发到网关**（不是网关慢）。处理顺序：
+
+1. 调大 `[transport].max_connections`（默认 64，可到 512）；
+2. 若环境里设了 `HTTP(S)_PROXY` 且不必须，把 `[transport].trust_env` 设为 `false` 直连；
+3. 减少并发调用同一插件的模型任务；
+4. 确认不是上游普遍变慢（看同时段是否有大量 read 超时）。
+
 **插件没出现在 WebUI**
 `_manifest.json` 是严格模式，多一个自造字段就整体加载失败。查看日志中
 `Manifest 校验失败` 的原文，或运行：
@@ -283,6 +321,8 @@ print('OK', m.id, m.version) if m else print('FAIL', v.errors)"
 * 宿主发送的是「Context Item」快照，插件按主程序规则投影成 `messages`（或 Responses 的
   `input`）；遇到未知 Item 类型会跳过而不是让请求失败，同时按数量与类型记一条 warning，
   避免上下文静默缺块；
+* responses 模式固定 `store=false`：不保留服务端响应，也就不可能靠
+  `previous_response_id` 续接会话（插件本来也没实现）；
 * `opencode-session-responses`（responses 协议）下拿不到 provider replay fragment，
   插件会省略 reasoning 项，影响是跨工具轮次的推理连续性（质量层面），不会因此被网关拒绝，
   详见第 5.1 节。没有特殊需求请让模型继续使用 `opencode-session`（chat）。
@@ -335,6 +375,50 @@ opencode-session-header/
 `999.999.999`，只认真约束 `min_version`。
 
 ## 12. 变更记录
+
+### 1.4.0
+
+修复 [issue #1](https://github.com/deepseekv41flash/maibot-opencode-session-header/issues/1)：
+连接池耗尽被误报成「网关超时 120s」。
+
+* **分相超时**：原来把单个 `timeout` 值同时套在 connect/pool/read/write 上，
+  于是连接池排队也要等满 120 秒，且错误信息看不出是本地排队。现在拆成
+  `connect` / `read` / `write` / `pool` 四个阶段，`pool_timeout` 默认 **10s**，
+  池满时快速失败并明确提示「请求还没发出去」；
+* **单独识别 `httpx.PoolTimeout`**：不再混进普通超时，错误信息给出可操作建议
+  （调大 `max_connections` / 关闭 `trust_env`）；
+* **连接池可配**：新增 `[transport]` 段（`max_connections` / `max_keepalive_connections` /
+  `connect_timeout` / `write_timeout` / `pool_timeout` / `read_timeout_ratio` / `trust_env`）；
+  默认上限由 32/16 提升到 **64/32**；
+* **read 超时留余量**：`read_timeout_ratio` 默认 0.9，使 read 超时严小于宿主 RPC 超时，
+  插件能在被宿主掐断前返回可读错误；
+* **`trust_env` 可关闭**：代理层 TLS 握手卡死会长期占用连接池，直连场景可设 `false`；
+* 配置热更新（`on_config_update`）会把新参数同步到传输层并重建客户端；
+  旧客户端进入退休列表、卸载时统一关闭，不会中断在途请求；
+* `config_version` 提升至 `1.4.0`；旧配置自动补出 `[transport]` 段。
+
+### 1.3.0
+
+* **移除 `[wire]` 配置节与 `responses_store`**：responses 模式现在**固定发送
+  `store: false`**，不再可配，也不会被 `extra_params` 覆盖。
+  原因：OpenCode 网关不是原生 Responses 目标，`store=true` 会让请求持续返回
+  `503 Endpoint is unavailable`（本机实测导致 26 小时、10818 行日志、0 次成功）；
+  而插件不发 `previous_response_id`，存了也取不回，只剩服务端留存成本。
+  改成 `store=false` 后同样条件立即恢复（503 归零、缓存命中 66.9%）。
+* 配置迁移：`config_version` 提升至 `1.3.0`；旧 `config.toml` 里的 `[wire]` 会被
+  Runner 自动丢弃，其余配置保持不变。
+* 无功能行为变化（除 store 之外）。
+
+### 1.2.1
+
+* **日志降噪**：Context Item 被跳过时按性质分级——宿主已知、但按设计没有可移植投影的
+  类型（`ReasoningItem`、`ProviderActivityItem`、`ProviderOpaqueItem`）只记 **debug**；
+  只有真正无法识别的 Item 类型才记 **warning**。
+  此前 responses 模式下每条请求都会刷出若干条「丢弃了 N 个无法投影的 Context Item」
+  告警（实测占掉 1600 行日志），把真正的错误淹没。
+* 线格式统计字典新增 `unprojectable_items` / `unprojectable_types` 两个键，
+  `dropped_items` / `dropped_types` 现在只统计真正未知的类型。
+* 无配置变更，`config_version` 保持 `1.2.0`。
 
 ### 1.2.0
 

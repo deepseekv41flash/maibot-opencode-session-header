@@ -3,6 +3,9 @@
 只做一件事：把已经拼好的请求体发到 ``{base_url}/chat/completions``，
 并按 Provider 配置补上鉴权头。所有异常都转成带可读原因的
 :class:`OpenCodeTransportError`，便于宿主日志直接定位问题。
+
+连接池与超时按「分相」配置（见 :class:`TransportSettings`）：``pool`` 排队超时远小于
+``read``，这样连接池被占满时会在几秒内报出明确原因，而不是挂 120 秒后伪装成网关超时。
 """
 
 from __future__ import annotations
@@ -166,18 +169,117 @@ def _strip_header_conflicts(headers: Mapping[str, str]) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() not in blocked}
 
 
+@dataclass(frozen=True, slots=True)
+class TransportSettings:
+    """HTTP 传输层参数。
+
+    连接的**分相超时**是这里的关键：把 ``pool``（连接池排队）与 ``read``（等响应）
+    拆开，池满时能在几秒内快速失败并给出明确原因，而不是伪装成「网关超时 120s」。
+    """
+
+    max_connections: int = 64
+    """连接池上限。非流式思考模型单请求可占用连接数十秒，池太小会被占满。"""
+
+    max_keepalive_connections: int = 32
+    """保活连接数。"""
+
+    connect_timeout: float = 10.0
+    """建连超时（秒）。"""
+
+    write_timeout: float = 30.0
+    """发送请求体超时（秒）。"""
+
+    pool_timeout: float = 10.0
+    """连接池排队超时（秒）。应当远小于 read 超时，否则池满时会长时间挂起。"""
+
+    read_timeout_ratio: float = 0.9
+    """read 超时 = Provider ``timeout`` × 本比例。
+
+    留出的余量用于在宿主 RPC 到点前返回可读错误（宿主 RPC 超时等于 Provider timeout）。
+    """
+
+    trust_env: bool = True
+    """是否读取系统 ``HTTP(S)_PROXY`` 环境变量。
+
+    关闭可避免代理层 TLS 握手卡死时长期占用连接池；直连场景建议关闭。
+    """
+
+
+def resolve_read_timeout(settings: TransportSettings, timeout_seconds: float) -> float:
+    """计算本次请求的 read 超时。
+
+    Args:
+        settings: 传输层参数。
+        timeout_seconds: Provider 配置的请求超时。
+
+    Returns:
+        float: read 阶段超时（秒）。
+    """
+
+    ratio = max(0.1, min(1.0, float(settings.read_timeout_ratio)))
+    return max(1.0, float(timeout_seconds) * ratio)
+
+
+def build_request_timeout(settings: TransportSettings, timeout_seconds: float) -> httpx.Timeout:
+    """按分相超时构造本次请求的 :class:`httpx.Timeout`。
+
+    Args:
+        settings: 传输层参数。
+        timeout_seconds: Provider 配置的请求超时。
+
+    Returns:
+        httpx.Timeout: 分相超时对象。
+    """
+
+    return httpx.Timeout(
+        connect=max(1.0, float(settings.connect_timeout)),
+        read=resolve_read_timeout(settings, timeout_seconds),
+        write=max(1.0, float(settings.write_timeout)),
+        pool=max(1.0, float(settings.pool_timeout)),
+    )
+
+
 class JsonTransport:
     """复用同一个 ``httpx.AsyncClient`` 的 JSON 端点传输器。"""
-
-    def __init__(self, *, connect_timeout: float = 15.0) -> None:
+    def __init__(self, settings: TransportSettings | None = None) -> None:
         """初始化传输器。
 
         Args:
-            connect_timeout: 建立连接的超时时间（秒）。
+            settings: 传输层参数；省略时使用默认值。
         """
 
-        self._connect_timeout = max(1.0, float(connect_timeout))
+        self._settings = settings or TransportSettings()
         self._client: httpx.AsyncClient | None = None
+        #: 配置热更新后退休的旧客户端，等卸载时统一关闭（避免中断在途请求）。
+        self._retired: list[httpx.AsyncClient] = []
+
+    @property
+    def settings(self) -> TransportSettings:
+        """返回当前传输层参数。
+
+        Returns:
+            TransportSettings: 当前参数。
+        """
+
+        return self._settings
+
+    def configure(self, settings: TransportSettings) -> None:
+        """更新传输层参数；参数变化时重建客户端。
+
+        旧客户端不立即关闭（可能仍有在途请求），而是移入退休列表，由
+        :meth:`aclose` 统一释放。配置热更新本身很少发生，这样做最安全。
+
+        Args:
+            settings: 新的传输层参数。
+        """
+
+        if settings == self._settings:
+            return
+        self._settings = settings
+        client = self._client
+        self._client = None
+        if client is not None and not client.is_closed:
+            self._retired.append(client)
 
     def _get_client(self) -> httpx.AsyncClient:
         """惰性创建并复用 HTTP 客户端。
@@ -187,19 +289,33 @@ class JsonTransport:
         """
 
         if self._client is None or self._client.is_closed:
+            settings = self._settings
+            # 客户端默认超时仅作兜底：每次请求都会通过 build_request_timeout 覆盖。
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self._connect_timeout, connect=min(10.0, self._connect_timeout)),
+                timeout=httpx.Timeout(
+                    connect=max(1.0, float(settings.connect_timeout)),
+                    read=60.0,
+                    write=max(1.0, float(settings.write_timeout)),
+                    pool=max(1.0, float(settings.pool_timeout)),
+                ),
                 follow_redirects=True,
-                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+                trust_env=bool(settings.trust_env),
+                limits=httpx.Limits(
+                    max_connections=max(1, int(settings.max_connections)),
+                    max_keepalive_connections=max(0, int(settings.max_keepalive_connections)),
+                ),
             )
         return self._client
 
     async def aclose(self) -> None:
-        """关闭底层客户端，释放连接池。"""
+        """关闭底层的当前客户端与所有退休客户端。"""
 
-        client = self._client
+        clients = [client for client in (self._client, *self._retired) if client is not None]
         self._client = None
-        if client is not None and not client.is_closed:
+        self._retired.clear()
+        for client in clients:
+            if client.is_closed:
+                continue
             try:
                 await client.aclose()
             except Exception:  # noqa: BLE001 - 关闭失败不应影响插件卸载
@@ -246,6 +362,8 @@ class JsonTransport:
 
         endpoint = build_endpoint(base_url, path)
         client = self._get_client()
+        settings = self._settings
+        read_timeout = resolve_read_timeout(settings, timeout_seconds)
         started = time.monotonic()
         try:
             response = await client.post(
@@ -253,10 +371,21 @@ class JsonTransport:
                 json=dict(body),
                 headers=headers,
                 params=params or None,
-                timeout=max(1.0, float(timeout_seconds)),
+                timeout=build_request_timeout(settings, timeout_seconds),
             )
+        except httpx.PoolTimeout as exc:
+            # 注意：PoolTimeout 是 TimeoutException 的子类，必须排在前面捕获。
+            raise OpenCodeTransportError(
+                f"本地连接池排队超时（{settings.pool_timeout:.0f}s，上限 {settings.max_connections} 条）："
+                "请求还没发出去就被放弃，通常是上游响应太慢把连接池占满了。"
+                "可调大 transport.max_connections，或把 transport.trust_env 设为 false 排除代理卡死",
+            ) from exc
         except httpx.TimeoutException as exc:
-            raise OpenCodeTransportError(f"请求 {endpoint} 超时（{timeout_seconds:.0f}s）: {exc}") from exc
+            raise OpenCodeTransportError(
+                f"请求 {endpoint} 超时"
+                f"（read={read_timeout:.0f}s / connect={settings.connect_timeout:.0f}s / "
+                f"pool={settings.pool_timeout:.0f}s）: {exc}"
+            ) from exc
         except httpx.HTTPError as exc:
             raise OpenCodeTransportError(f"请求 {endpoint} 失败: {exc}") from exc
 

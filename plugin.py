@@ -39,6 +39,7 @@ from .openai_transport import (
     RESPONSES_PATH,
     JsonTransport,
     OpenCodeTransportError,
+    TransportSettings,
 )
 from .openai_wire import (
     build_chat_messages,
@@ -120,7 +121,7 @@ class PluginSectionConfig(PluginConfigBase):
         default=True,
         description="是否注入会话头。关闭后请求照常转发，但不再添加任何头。",
     )
-    config_version: str = Field(default="1.2.0", description="配置版本")
+    config_version: str = Field(default="1.4.0", description="配置版本")
 
 
 class EndpointSectionConfig(PluginConfigBase):
@@ -186,16 +187,56 @@ class SessionHeaderSectionConfig(PluginConfigBase):
     )
 
 
-class WireSectionConfig(PluginConfigBase):
-    """Responses 协议参数（协议本身由 client_type 决定）。"""
+class TransportSectionConfig(PluginConfigBase):
+    """HTTP 传输层配置。
 
-    __ui_label__ = "Responses 协议"
-    __ui_icon__ = "plug"
+    核心是**分相超时**：``pool_timeout`` 远小于 read 超时，连接池被占满时能在几秒内
+    报出「本地连接池排队超时」，而不是挂 120 秒后伪装成网关超时（见 issue #1）。
+    """
+
+    __ui_label__ = "传输层"
+    __ui_icon__ = "network"
     __ui_order__ = 3
 
-    responses_store: bool = Field(
-        default=False,
-        description="仅 opencode-session-responses 使用：是否让网关保存响应（store）。默认 false。",
+    max_connections: int = Field(
+        default=64,
+        ge=8,
+        le=512,
+        description="连接池上限。非流式思考模型单请求可占用连接数十秒，池太小会被占满。",
+    )
+    max_keepalive_connections: int = Field(
+        default=32,
+        ge=0,
+        le=256,
+        description="保活连接数。",
+    )
+    connect_timeout: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=120.0,
+        description="建连超时（秒）。",
+    )
+    write_timeout: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=300.0,
+        description="发送请求体超时（秒）。",
+    )
+    pool_timeout: float = Field(
+        default=10.0,
+        ge=1.0,
+        le=120.0,
+        description="连接池排队超时（秒）。应远小于 read 超时，池满时快速失败。",
+    )
+    read_timeout_ratio: float = Field(
+        default=0.9,
+        ge=0.3,
+        le=1.0,
+        description="read 超时 = Provider timeout × 本比例；留出余量以便在宿主 RPC 超时前返回可读错误。",
+    )
+    trust_env: bool = Field(
+        default=True,
+        description="是否读取系统 HTTP(S)_PROXY 环境变量。若怀疑代理导致连接卡死，设 false 直连。",
     )
 
 
@@ -205,7 +246,7 @@ class OpenCodeSessionHeaderConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     endpoint: EndpointSectionConfig = Field(default_factory=EndpointSectionConfig)
     session_header: SessionHeaderSectionConfig = Field(default_factory=SessionHeaderSectionConfig)
-    wire: WireSectionConfig = Field(default_factory=WireSectionConfig)
+    transport: TransportSectionConfig = Field(default_factory=TransportSectionConfig)
 
 
 class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
@@ -218,6 +259,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
 
         super().__init__()
         self._transport = JsonTransport()
+        self._transport_configured = False
         self._seed_store: SessionSeedStore | None = None
 
     # ── 生命周期 ────────────────────────────────────────────────
@@ -225,6 +267,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
     async def on_load(self) -> None:
         """插件加载时执行。"""
 
+        self._apply_transport_settings()
         suffix_text = ", ".join(self.config.endpoint.host_suffixes) or "<空>"
         self.ctx.logger.info(
             f"OpenCode 会话头注入插件已加载：匹配域名 [{suffix_text}]，"
@@ -250,6 +293,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         """
 
         del scope, config_data, version
+        self._apply_transport_settings()
         self.ctx.logger.info("OpenCode 会话头注入插件配置已热重载")
 
     # ── LLM Provider ───────────────────────────────────────────
@@ -259,7 +303,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         handler_name="dispatch_chat",
         name="OpenCode 会话头注入（Chat Completions）",
         description="转发 POST /chat/completions，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
-        version="1.2.0",
+        version="1.4.0",
     )
     async def dispatch_chat(
         self,
@@ -289,7 +333,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         handler_name="dispatch_responses",
         name="OpenCode 会话头注入（Responses）",
         description="转发 POST /responses，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
-        version="1.2.0",
+        version="1.4.0",
     )
     async def dispatch_responses(
         self,
@@ -358,6 +402,9 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         """
 
         config = self.config
+        if not self._transport_configured:
+            # on_load 未跑（例如异常路径直接进 Provider）时兜底应用一次。
+            self._apply_transport_settings()
         api_provider = dict(request.get("api_provider") or {})
         model_info = dict(request.get("model_info") or {})
         base_url = str(api_provider.get("base_url") or "")
@@ -542,6 +589,23 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         }
 
     # ── 内部实现 ────────────────────────────────────────────────
+
+    def _apply_transport_settings(self) -> None:
+        """把 ``[transport]`` 配置同步到 HTTP 传输层。"""
+
+        config = self.config.transport
+        self._transport.configure(
+            TransportSettings(
+                max_connections=config.max_connections,
+                max_keepalive_connections=config.max_keepalive_connections,
+                connect_timeout=config.connect_timeout,
+                write_timeout=config.write_timeout,
+                pool_timeout=config.pool_timeout,
+                read_timeout_ratio=config.read_timeout_ratio,
+                trust_env=config.trust_env,
+            )
+        )
+        self._transport_configured = True
 
     def _seed_store_instance(self) -> SessionSeedStore:
         """取得（必要时创建）会话种子仓库。
@@ -729,19 +793,32 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         return body
 
     def _log_dropped_items(self, stats: Mapping[str, Any], protocol: str) -> None:
-        """未识别 Context Item 被丢弃时留一条日志，避免上下文静默缺块。
+        """Context Item 被跳过时记录日志。
+
+        宿主已知且按设计没有可移植投影的类型（reasoning、Provider 原生活动、不透明项）
+        只记 debug，避免刷屏；只有真正未知的类型才告警。
 
         Args:
             stats: 线格式投影写回的统计字典。
             protocol: 当前线上协议名。
         """
 
+        unprojectable = int(stats.get("unprojectable_items") or 0)
+        if unprojectable > 0:
+            unprojectable_types = ", ".join(
+                str(item) for item in (stats.get("unprojectable_types") or [])
+            )
+            self.ctx.logger.debug(
+                f"OpenCode 会话头注入: 线格式 {protocol} 跳过了 {unprojectable} 个无投影的 Context Item"
+                f"（类型：{unprojectable_types or '<空类型>'}），这是预期行为"
+            )
+
         dropped = int(stats.get("dropped_items") or 0)
         if dropped <= 0:
             return
         dropped_types = ", ".join(str(item) for item in (stats.get("dropped_types") or []))
         self.ctx.logger.warning(
-            f"OpenCode 会话头注入: 线格式 {protocol} 丢弃了 {dropped} 个无法投影的 Context Item"
+            f"OpenCode 会话头注入: 线格式 {protocol} 丢弃了 {dropped} 个无法识别的 Context Item"
             f"（类型：{dropped_types or '<空类型>'}）；通常意味着宿主新增了插件尚不认识的 Item 类型"
         )
 
@@ -775,7 +852,10 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
 
         body.setdefault("model", str(model_info.get("model_identifier") or ""))
         body.setdefault("input", input_items)
-        body.setdefault("store", bool(self.config.wire.responses_store))
+        # 固定 store=false：OpenCode 网关不是原生 Responses 目标，无法持久化响应。
+        # 开启 store 会让请求直接 503（Endpoint is unavailable），且插件并不发送
+        # previous_response_id，存了也不会取回，只会带来 30 天留存成本。
+        body["store"] = False
         if tools:
             body.setdefault("tools", tools)
 

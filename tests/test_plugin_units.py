@@ -27,6 +27,11 @@ from openai_wire import (  # noqa: E402
     parse_responses_output,
     parse_tool_arguments,
 )
+from openai_transport import (  # noqa: E402
+    TransportSettings,
+    build_request_timeout,
+    resolve_read_timeout,
+)
 from session_identity import (  # noqa: E402
     SessionSeedStore,
     derive_session_token,
@@ -534,17 +539,24 @@ class DroppedItemStatsTests(unittest.TestCase):
         self.assertEqual(stats["dropped_items"], 1)
         self.assertEqual(stats["dropped_types"], ["BrandNewItem"])
 
-    def test_responses_counts_unknown_items(self) -> None:
+    def test_responses_separates_unprojectable_from_unknown(self) -> None:
+        """按设计不可投影的类型不算「未知类型」，否则会刷屏告警。"""
+
         items = [
             self._item("UserMessageItem", parts=[{"type": "text", "text": "u"}]),
             self._item("ReasoningItem"),
+            self._item("ProviderActivityItem", provider_type="web_search"),
             self._item("BrandNewItem"),
         ]
         stats: dict = {}
         input_items = build_responses_input(items, has_tools=False, stats=stats)
         self.assertEqual(len(input_items), 1)
-        self.assertEqual(stats["dropped_items"], 2)
-        self.assertEqual(stats["dropped_types"], ["BrandNewItem", "ReasoningItem"])
+        # 只有真正未知的类型才计入 dropped（会告警）
+        self.assertEqual(stats["dropped_items"], 1)
+        self.assertEqual(stats["dropped_types"], ["BrandNewItem"])
+        # 宿主已知但无投影的类型单独统计（只记 debug）
+        self.assertEqual(stats["unprojectable_items"], 2)
+        self.assertEqual(stats["unprojectable_types"], ["ProviderActivityItem", "ReasoningItem"])
 
     def test_no_drop_reports_zero(self) -> None:
         items = [self._item("UserMessageItem", parts=[{"type": "text", "text": "u"}])]
@@ -552,11 +564,49 @@ class DroppedItemStatsTests(unittest.TestCase):
         build_chat_messages(items, has_tools=False, stats=stats)
         self.assertEqual(stats["dropped_items"], 0)
         self.assertEqual(stats["dropped_types"], [])
+        self.assertEqual(stats["unprojectable_items"], 0)
+        self.assertEqual(stats["unprojectable_types"], [])
 
     def test_stats_is_optional(self) -> None:
         items = [self._item("BrandNewItem")]
         self.assertEqual(build_chat_messages(items, has_tools=True), [])
         self.assertEqual(build_responses_input(items, has_tools=True), [])
+
+
+
+class TransportTimeoutTests(unittest.TestCase):
+    """传输层分相超时（issue #1：连接池耗尽伪装成网关超时）。"""
+
+    def test_defaults_are_production_sane(self) -> None:
+        settings = TransportSettings()
+        self.assertEqual(settings.max_connections, 64)
+        self.assertEqual(settings.max_keepalive_connections, 32)
+        self.assertLessEqual(settings.pool_timeout, 30.0)
+        self.assertLess(settings.pool_timeout, 120.0)
+
+    def test_pool_timeout_is_independent_of_read_timeout(self) -> None:
+        """池排队必须远小于 read，否则池满会挂满整个请求超时。"""
+
+        settings = TransportSettings()
+        timeout = build_request_timeout(settings, 120.0)
+        self.assertEqual(float(timeout.pool), settings.pool_timeout)
+        self.assertEqual(float(timeout.connect), settings.connect_timeout)
+        self.assertEqual(float(timeout.write), settings.write_timeout)
+        self.assertGreater(float(timeout.read), float(timeout.pool) * 5)
+
+    def test_read_timeout_keeps_headroom_for_rpc_deadline(self) -> None:
+        """read 必须严小于 Provider timeout，才能在宿主 RPC 到点前返回可读错误。"""
+
+        settings = TransportSettings(read_timeout_ratio=0.9)
+        self.assertEqual(resolve_read_timeout(settings, 120.0), 108.0)
+        self.assertLess(resolve_read_timeout(settings, 120.0), 120.0)
+
+    def test_ratio_is_clamped(self) -> None:
+        self.assertEqual(resolve_read_timeout(TransportSettings(read_timeout_ratio=0.0), 100.0), 10.0)
+        self.assertEqual(resolve_read_timeout(TransportSettings(read_timeout_ratio=5.0), 100.0), 100.0)
+
+    def test_read_timeout_has_floor(self) -> None:
+        self.assertGreaterEqual(resolve_read_timeout(TransportSettings(), 0.1), 1.0)
 
 
 if __name__ == "__main__":
