@@ -27,6 +27,11 @@
       "type": "python_package",
       "name": "httpx",
       "version_spec": ">=0.27"
+    },
+    {
+      "type": "python_package",
+      "name": "openai",
+      "version_spec": ">=1.0"
     }
   ],
   "llm_providers": [
