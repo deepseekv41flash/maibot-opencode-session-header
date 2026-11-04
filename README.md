@@ -41,6 +41,37 @@ MaiBot 允许插件注册自己的 **LLM Provider**（对应模型配置里的 `
 > 只影响你把 `client_type` 指向本插件的那些模型。使用内置 `openai`、
 > `openai_responses`、`gemini` 的模型、以及其他 Provider，一条请求都不会被改动。
 
+## 2.1 传输层与超时（本次重构后）
+
+本次重构后传输层不再由插件自己维护连接池：
+
+* **主路径（chat_completions + `auth_type = "bearer"`）改用官方 `openai` SDK**
+  （`AsyncOpenAI`），连接池与超时分层交给 SDK；插件固定 `max_retries = 0`，不偷偷重试，
+  重试仍由宿主的 `hard_timeout` + 换模型机制负责；
+* **`/responses` 协议与 `header` / `query` / `none` 鉴权仍走插件自带的 httpx 实现**
+  （这些场景 SDK 覆盖不到），两条路径共用同一套端点识别、鉴权头与会话头注入逻辑；
+* 运行环境缺少 `openai` 时整体退回纯 httpx 路径，功能不受影响。
+
+超时分层（避免「一个总超时把 connect / pool 也一起套住」）：
+
+| 阶段 | 值 | 说明 |
+|---|---|---|
+| connect | 10s | 建连 / TLS 握手 |
+| read | `min(任务超时, 90s)`，下限 30s | 等模型生成；**刻意短于宿主默认 `hard_timeout`（120s）**，让插件先于宿主报错 |
+| write | 30s | 上传请求体 |
+| pool | 10s | 从连接池取连接的排队上限 |
+
+连接池：主路径 1000 条 / 保活 100 条，回退路径同规格。旧版 32 条的小池已移除——那正是
+「池内槽位被长请求占满、新请求排队 120s 才报 `PoolTimeout`」的根源。
+
+**直连（不走系统代理）**：传输层固定 `trust_env = False`，**不读取** `HTTP_PROXY` /
+`HTTPS_PROXY` / `NO_PROXY`。这是有意的：经本地 HTTP 代理转发到 `opencode.ai` 时，
+TLS 握手会偶发卡死（实测约 10% 的并发请求建连超时），直连更稳。若你的网络必须经代理
+访问，请使用系统级 TUN / 透明代理，而不是 HTTP 代理环境变量。
+
+**池排队自愈**：万一仍遇到连接池排队超时，插件会关闭并重建整个 HTTP 客户端再抛错，
+错误信息里带「已重置连接池」，下一次请求从干净状态开始。
+
 ## 3. 安装与启用
 
 插件目录：`data/MaiMBot/plugins/opencode-session-header/`（本机为
@@ -50,6 +81,9 @@ MaiBot 允许插件注册自己的 **LLM Provider**（对应模型配置里的 `
 2. 打开 WebUI（本机 <http://127.0.0.1:18001>）→ 插件管理 → 找到
    **OpenCode 会话头注入** → 启用；
 3. 首次加载后，插件目录内会自动生成 `config.toml`（**不要提交**，已在 `.gitignore` 中）。
+
+> 本次重构起 `_manifest.json` 声明了 `openai>=1.0` 依赖，Runner 加载插件时会自动安装；
+> 装不上时插件退回纯 httpx 传输，功能一致（只是没有 SDK 的连接池管理）。
 
 ## 4. 关键一步：把模型指向本插件
 
@@ -87,7 +121,7 @@ client_type = "opencode-session"   # ← 关键：默认是 "openai"
 | 键 | 默认值 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 是否注入会话头。关闭后请求照常转发，只是不加头 |
-| `config_version` | `1.1.0` | 配置版本，勿手改（与插件版本号无关，仅在配置结构变化时递增） |
+| `config_version` | `1.2.0` | 配置版本，勿手改（与插件版本号无关，仅在配置结构变化时递增） |
 
 ### `[endpoint]`
 
@@ -239,7 +273,7 @@ POST /zen/go/v1/responses        -> 401 AuthError: Missing API key.
 * `verbose` 日志会输出端点、协议、是否命中、注入的**头名**与种子来源（如 `fallback:provider|host`、
   `env:NAME`）——**不输出令牌值**，也不含聊天内容；但种子来源会暴露部署细节，请按你所在部署的
   日志留存策略处理；
-* **重定向**：HTTP 传输沿用 httpx 的默认行为（`follow_redirects=True`）。当重定向目标与
+* **重定向**：两条传输路径（SDK 与 httpx 回退）都启用 `follow_redirects=True`。当重定向目标与
   原地址**不同源**（协议 / 主机 / 端口任一不同）时，httpx 会剥离标准 `Authorization` 头
   （同主机 `http → https` 升级除外），但**不会剥离自定义鉴权头**——即 `auth_type = "header"`
   时配置的 `auth_header_name` 会被带到重定向目标；`307` / `308` 还会把请求体重发到新主机。
@@ -270,6 +304,11 @@ print('OK', m.id, m.version) if m else print('FAIL', v.errors)"
 
 **改了配置没生效**
 `config.toml` 由 Runner 生成与维护；在 WebUI 里改，或改完文件后在插件管理里重载。
+
+**日志里出现「连接池排队超时」**
+本次重构起插件会在报错前自动重置连接池，偶发一次不必处理；若持续出现，说明仍有请求长期
+占用连接（例如上游静默挂起、或大量并发思考模型请求），把该时段的日志与同时发起的
+任务量一起提供；必要时临时降低后台任务并发或给学习类任务换轻量模型。
 
 **突然开始报鉴权错误**
 本插件用自己的传输层发送请求，鉴权方式完全按服务商配置里的
@@ -325,16 +364,37 @@ opencode-session-header/
 | 项 | 值 |
 |---|---|
 | 插件 ID | `maibot.opencode-session-header` |
-| 版本 | `1.1.3` |
+| 版本 | `1.2.0` |
 | 作者 | deepseekv41flash |
 | 仓库 | https://github.com/deepseekv41flash/maibot-opencode-session-header |
 | 许可证 | MIT |
 
 插件市场按 **Release 版本**收录，Tag 与 `_manifest.json` 的 `version` 必须一致
-（`v1.1.3` ↔ `1.1.3`）。`host_application` / `sdk` 的上界按官方建议置于
+（`v1.2.0` ↔ `1.2.0`）。`host_application` / `sdk` 的上界按官方建议置于
 `999.999.999`，只认真约束 `min_version`。
 
 ## 12. 变更记录
+
+### 未发布
+
+* **重构**：传输层改用官方 `openai` SDK（`AsyncOpenAI`）——连接池与超时分层交给 SDK，
+  插件不再自维护 `httpx.AsyncClient` 小池；`/responses` 与 `header` / `query` / `none`
+  鉴权仍走插件自带 httpx 回退路径；
+* **修复**：`PoolTimeout` 高发。旧版把宿主任务超时（默认 120s）当作**总超时**传给
+  `client.post(timeout=...)`，同时覆盖 connect / pool / read：连接池一旦被长请求
+  （思考模型单次 45–55s）占满，新请求会排队到 120s 才失败，失败又触发宿主换模型重试，
+  进一步放大并发。现在拆成 connect 10s / read `min(任务超时, 90s)` / write 30s / pool 10s；
+* **行为变更**：传输层固定 `trust_env = False`，**不再读取 `HTTP_PROXY` / `HTTPS_PROXY` /
+  `NO_PROXY`**，对 `opencode.ai` 一律直连（经本地 HTTP 代理转发时 TLS 握手偶发卡死）。
+  需要走代理的部署请改用 TUN / 透明代理；
+* **韧性**：连接池排队超时会关闭并重建 HTTP 客户端（错误信息注明「已重置连接池」）；
+  SDK 路径固定 `max_retries = 0`，重试仍由宿主 `hard_timeout` + 换模型机制负责；
+* **依赖**：`_manifest.json` 新增 `openai>=1.0`，未安装时自动退回纯 httpx 路径；
+* 本次**不提升**插件版本号（`_manifest.json` 与 `@LLMProvider` 的 `version` 保持
+  `1.2.0`），由维护者在发版时统一决定；`config_version` 同样保持 `1.2.0`——配置结构没有变化。
+
+**兼容性**：请求/响应结构与配置项均未变，升级后无需改配置；唯一需要留意的是
+「不再走 HTTP 代理环境变量」这一行为变更。
 
 ### 1.2.0
 
