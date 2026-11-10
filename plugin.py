@@ -306,7 +306,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         handler_name="dispatch_chat",
         name="OpenCode 会话头注入（Chat Completions）",
         description="转发 POST /chat/completions，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
-        version="1.5.1",
+        version="1.5.2",
     )
     async def dispatch_chat(
         self,
@@ -336,7 +336,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         handler_name="dispatch_responses",
         name="OpenCode 会话头注入（Responses）",
         description="转发 POST /responses，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
-        version="1.5.1",
+        version="1.5.2",
     )
     async def dispatch_responses(
         self,
