@@ -239,6 +239,43 @@ def build_request_timeout(settings: TransportSettings, timeout_seconds: float) -
     )
 
 
+#: 网络层异常 → 可读原因。httpx 多数网络异常的 ``str()`` 为空，必须显式带类名。
+_NETWORK_ERROR_HINTS: dict[str, str] = {
+    "ReadError": "读取响应时连接中断（对端关闭/重置，常见于长连接被中间设备回收）",
+    "WriteError": "发送请求时连接中断",
+    "ConnectError": "建立连接失败（DNS/网络/防火墙/证书）",
+    "ConnectTimeout": "建立连接超时",
+    "ReadTimeout": "等待响应超时",
+    "WriteTimeout": "发送请求超时",
+    "PoolTimeout": "本地连接池排队超时",
+    "RemoteProtocolError": "对端在返回完整响应前关闭了连接",
+    "LocalProtocolError": "本地请求构造不合法（协议错误）",
+    "ProxyError": "经由代理建立连接失败",
+    "UnsupportedProtocol": "不支持的协议或 base_url 写法有误",
+    "TooManyRedirects": "重定向次数过多",
+    "DecodingError": "响应体解码失败",
+}
+
+
+def describe_network_error(error: BaseException) -> str:
+    """把 httpx / httpcore 网络异常渲染成可读描述。
+
+    ``str(httpx.ReadError())`` 之类的异常消息通常为空字符串，
+    直接拼进日志只会剩一个冒号，因此这里显式带上具体原因与异常类名。
+
+    Args:
+        error: 捕获到的异常。
+
+    Returns:
+        str: 形如 ``读取响应时连接中断（ReadError）`` 的描述。
+    """
+
+    name = type(error).__name__
+    hint = _NETWORK_ERROR_HINTS.get(name, "网络请求失败")
+    detail = str(error).strip()
+    return f"{hint}（{name}）" + (f"：{detail}" if detail else "")
+
+
 class JsonTransport:
     """复用同一个 ``httpx.AsyncClient`` 的 JSON 端点传输器。"""
     def __init__(self, settings: TransportSettings | None = None) -> None:
@@ -381,13 +418,21 @@ class JsonTransport:
                 "可调大 transport.max_connections，或把 transport.trust_env 设为 false 排除代理卡死",
             ) from exc
         except httpx.TimeoutException as exc:
+            detail = str(exc).strip()
             raise OpenCodeTransportError(
                 f"请求 {endpoint} 超时"
-                f"（read={read_timeout:.0f}s / connect={settings.connect_timeout:.0f}s / "
-                f"pool={settings.pool_timeout:.0f}s）: {exc}"
+                f"（{type(exc).__name__}；read={read_timeout:.0f}s / "
+                f"connect={settings.connect_timeout:.0f}s / pool={settings.pool_timeout:.0f}s）"
+                + (f"：{detail}" if detail else "")
+            ) from exc
+        except httpx.RequestError as exc:
+            # 连接建立/复用/读写失败：httpx 的 str() 往往为空，用 describe_network_error 补全原因。
+            raise OpenCodeTransportError(
+                f"请求 {endpoint} 失败：{describe_network_error(exc)}"
             ) from exc
         except httpx.HTTPError as exc:
-            raise OpenCodeTransportError(f"请求 {endpoint} 失败: {exc}") from exc
+            detail = describe_network_error(exc)
+            raise OpenCodeTransportError(f"请求 {endpoint} 失败：{detail}") from exc
 
         latency_ms = int((time.monotonic() - started) * 1000)
         text = response.text or ""

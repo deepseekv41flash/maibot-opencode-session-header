@@ -31,6 +31,7 @@ from openai_wire import (  # noqa: E402
 )
 from openai_transport import (  # noqa: E402
     TransportSettings,
+    describe_network_error,
     build_request_timeout,
     resolve_read_timeout,
 )
@@ -693,6 +694,51 @@ class OutputItemsTests(unittest.TestCase):
             ],
         )
         self.assertEqual(items[0]["tool_call"]["extra_content"], {"source": "response"})
+
+
+
+class NetworkErrorDescribeTests(unittest.TestCase):
+    """网络异常可读化：httpx 很多异常的 str() 为空，必须带上类名与原因。
+
+    只依赖标准库：``describe_network_error`` 以 ``type(exc).__name__`` 分类，
+    因此用同名假异常即可覆盖，无需真的导入 httpx。
+    """
+
+    @staticmethod
+    def _make(name: str, message: str = "") -> Exception:
+        cls = type(name, (Exception,), {})
+        return cls(message)
+
+    def test_read_error_without_message(self) -> None:
+        text = describe_network_error(self._make("ReadError"))
+        self.assertIn("ReadError", text)
+        self.assertIn("连接中断", text)
+
+    def test_connect_error_keeps_detail(self) -> None:
+        text = describe_network_error(self._make("ConnectError", "DNS fail"))
+        self.assertIn("ConnectError", text)
+        self.assertIn("DNS fail", text)
+        self.assertIn("建立连接失败", text)
+
+    def test_remote_protocol_error(self) -> None:
+        text = describe_network_error(self._make("RemoteProtocolError"))
+        self.assertIn("RemoteProtocolError", text)
+        self.assertIn("关闭了连接", text)
+
+    def test_unknown_error_falls_back(self) -> None:
+        text = describe_network_error(self._make("WeirdError", "boom"))
+        self.assertIn("WeirdError", text)
+        self.assertIn("boom", text)
+        self.assertIn("网络请求失败", text)
+
+    def test_message_never_ends_with_bare_colon(self) -> None:
+        """回归：旧实现日志会出现「失败: 」这种空尾巴。"""
+
+        for name in ("ReadError", "WriteError", "ConnectError"):
+            with self.subTest(exc=name):
+                text = describe_network_error(self._make(name))
+                self.assertFalse(text.endswith("："))
+                self.assertTrue(text.strip())
 
 
 if __name__ == "__main__":

@@ -412,6 +412,24 @@ opencode-session-header/
 
 ## 12. 变更记录
 
+### 1.5.1
+
+* **网络异常信息可读化**：此前 `httpx.ReadError` / `ConnectError` 之类的异常
+  `str()` 为空，日志里只剩「请求 … 失败: 」一个冒号，看不出发生了什么。
+  现在统一经 `describe_network_error()` 渲染，带上**具体原因 + 异常类名 + 原始消息**，
+  例如：
+
+  ```
+  请求 https://opencode.ai/zen/go/v1/responses 失败：
+  读取响应时连接中断（对端关闭/重置，常见于长连接被中间设备回收）（ReadError）
+  ```
+
+* 超时分支同样补上异常类名（`ReadTimeout` / `ConnectTimeout` / `PoolTimeout`），
+  便于区分是「等响应超时」还是「建连超时」；
+* 覆盖 `httpx.RequestError`（连接建立 / 复用 / 读写失败）与其余 `HTTPError` 的兜底；
+* 新增 5 项单元测试；用真实「服务端读完请求即断开」复现，确认信息可读；
+* 无配置变更，`config_version` 保持 `1.4.0`。
+
 ### 1.5.0
 
 响应协议迁移到宿主的**新版 Item 数组**，消除「旧版 content/reasoning/tool_calls 标量协议」
