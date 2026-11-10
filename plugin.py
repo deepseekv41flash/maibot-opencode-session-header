@@ -42,6 +42,7 @@ from .openai_transport import (
     TransportSettings,
 )
 from .openai_wire import (
+    KNOWN_ITEM_SCHEMA_VERSION,
     build_chat_messages,
     build_chat_tools,
     build_responses_input,
@@ -49,6 +50,7 @@ from .openai_wire import (
     build_responses_tools,
     build_response_format,
     build_tool_calls,
+    build_output_items,
     build_usage,
     extract_response_content,
     parse_responses_output,
@@ -260,6 +262,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         super().__init__()
         self._transport = JsonTransport()
         self._transport_configured = False
+        self._schema_version_warned = False
         self._seed_store: SessionSeedStore | None = None
 
     # ── 生命周期 ────────────────────────────────────────────────
@@ -303,7 +306,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         handler_name="dispatch_chat",
         name="OpenCode 会话头注入（Chat Completions）",
         description="转发 POST /chat/completions，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
-        version="1.4.0",
+        version="1.5.0",
     )
     async def dispatch_chat(
         self,
@@ -333,7 +336,7 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         handler_name="dispatch_responses",
         name="OpenCode 会话头注入（Responses）",
         description="转发 POST /responses，命中 opencode.ai 时注入稳定的 X-OpenCode-Session。",
-        version="1.4.0",
+        version="1.5.0",
     )
     async def dispatch_responses(
         self,
@@ -448,8 +451,10 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
             )
 
         if protocol == PROTOCOL_RESPONSES:
-            return self._build_responses_result(transport_result.payload, model_info, api_provider)
-        return self._build_chat_result(transport_result.payload, model_info, api_provider)
+            result = self._build_responses_result(transport_result.payload, model_info, api_provider)
+        else:
+            result = self._build_chat_result(transport_result.payload, model_info, api_provider)
+        return self._finalize_result(result, request)
 
     # ── 命令 ───────────────────────────────────────────────────
 
@@ -1034,6 +1039,47 @@ class OpenCodeSessionHeaderPlugin(MaiBotPlugin, LLMProviderBase):
         }
         if usage is not None:
             result["usage"] = usage
+        return result
+
+    def _finalize_result(
+        self,
+        result: dict[str, Any],
+        request: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """为新版宿主补齐 ``output_items``（Item 数组协议）。
+
+        宿主 ``PluginLLMClient`` 会优先读取 ``output_items``；只有缺失时才回退到
+        ``content``/``reasoning_content``/``tool_calls`` 标量协议，而该兼容入口
+        将在下一个 Item schema 版本删除。因此这里始终提供 Item 数组，同时保留
+        标量字段以兼容旧版宿主。
+
+        Args:
+            result: :meth:`_assemble_result` 装配出的响应字典。
+            request: 宿主原始请求快照（用于读取 ``item_schema_version``）。
+
+        Returns:
+            dict[str, Any]: 补齐 ``output_items`` / ``item_schema_version`` 后的结果。
+        """
+
+        try:
+            schema_version = int(request.get("item_schema_version"))
+        except (TypeError, ValueError):
+            schema_version = KNOWN_ITEM_SCHEMA_VERSION
+
+        if schema_version != KNOWN_ITEM_SCHEMA_VERSION and not self._schema_version_warned:
+            self._schema_version_warned = True
+            self.ctx.logger.warning(
+                f"宿主 Item schema 版本为 {schema_version}，本插件仅验证过 "
+                f"{KNOWN_ITEM_SCHEMA_VERSION}；仍按已验证的格式输出 Items，"
+                "如出现「output_items 非法」请升级插件"
+            )
+
+        result["output_items"] = build_output_items(
+            content=str(result.get("content") or ""),
+            reasoning=str(result.get("reasoning_content") or ""),
+            tool_calls=list(result.get("tool_calls") or []),
+        )
+        result["item_schema_version"] = schema_version
         return result
 
     def _build_status_text(self) -> str:

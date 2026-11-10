@@ -876,3 +876,85 @@ def parse_responses_output(payload: Mapping[str, Any]) -> ResponsesOutput:
         status=status,
         incomplete_reason=_responses_error_text(payload) if status in {"failed", "incomplete", "cancelled"} else "",
     )
+
+
+# ── 新版 Item 数组协议（output_items）─────────────────────
+
+#: 本插件验证过的宿主 Item schema 版本（对应 CONTEXT_ITEM_SCHEMA_VERSION）。
+#: 宿主升级该版本后，需要复核本模块的投影格式。
+KNOWN_ITEM_SCHEMA_VERSION = 1
+
+
+def build_output_items(
+    *,
+    content: str,
+    reasoning: str,
+    tool_calls: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """把可移植正文 / 推理 / 工具调用投影为宿主的 ``output_items`` 数组。
+
+    语义对齐宿主 ``build_portable_output_items``：
+
+    1. 先 reasoning（表示方式 ``raw_text``），再正文，最后工具调用；
+    2. 文本先 ``strip()``，空串直接丢弃；
+    3. 宿主会为每个 Item 覆盖 ``meta``（item_id / logical_turn_id / timestamp），
+       因此这里不需要提供 ``meta``。
+
+    宿主在下个 Item schema 版本会删除 ``content``/``reasoning``/``tool_calls``
+    兼容入口，所以必须优先使用本函数产生的数组。
+
+    Args:
+        content: 模型正文。
+        reasoning: 模型推理内容。
+        tool_calls: 已规范化为 OpenAI 结构的工具调用列表。
+
+    Returns:
+        list[dict[str, Any]]: 可直接放进 ``result["output_items"]`` 的序列化 Item 列表。
+    """
+
+    items: list[dict[str, Any]] = []
+
+    normalized_reasoning = str(reasoning or "").strip()
+    if normalized_reasoning:
+        items.append(
+            {
+                "item_type": "ReasoningItem",
+                "representation": "raw_text",
+                "summary_parts": [],
+                "text_parts": [normalized_reasoning],
+            }
+        )
+
+    normalized_content = str(content or "").strip()
+    if normalized_content:
+        items.append(
+            {
+                "item_type": "AssistantMessageItem",
+                "parts": [{"type": "text", "text": normalized_content}],
+            }
+        )
+
+    for raw_tool_call in tool_calls:
+        tool_call = _as_mapping(raw_tool_call)
+        function = _as_mapping(tool_call.get("function"))
+        call_id = str(tool_call.get("id") or tool_call.get("call_id") or "").strip()
+        func_name = str(function.get("name") or tool_call.get("name") or "").strip()
+        if not call_id or not func_name:
+            continue
+        arguments = function.get("arguments")
+        if not isinstance(arguments, Mapping):
+            arguments = parse_tool_arguments(arguments)
+        entry: dict[str, Any] = {
+            "item_type": "FunctionCallItem",
+            "tool_call": {
+                "call_id": call_id,
+                "func_name": func_name,
+                "args": dict(arguments),
+            },
+        }
+        extra_content = tool_call.get("extra_content")
+        if isinstance(extra_content, Mapping) and extra_content:
+            entry["tool_call"]["extra_content"] = dict(extra_content)
+        items.append(entry)
+
+    return items

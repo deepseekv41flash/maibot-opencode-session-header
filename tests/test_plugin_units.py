@@ -16,8 +16,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from openai_wire import (  # noqa: E402
+    KNOWN_ITEM_SCHEMA_VERSION,
     build_chat_messages,
     build_chat_tools,
+    build_output_items,
     build_responses_input,
     build_responses_text_config,
     build_responses_tools,
@@ -607,6 +609,90 @@ class TransportTimeoutTests(unittest.TestCase):
 
     def test_read_timeout_has_floor(self) -> None:
         self.assertGreaterEqual(resolve_read_timeout(TransportSettings(), 0.1), 1.0)
+
+
+
+class OutputItemsTests(unittest.TestCase):
+    """新版 Item 数组协议（output_items）：替代旧版标量协议。"""
+
+    def test_known_schema_version(self) -> None:
+        self.assertEqual(KNOWN_ITEM_SCHEMA_VERSION, 1)
+
+    def test_order_reasoning_content_tool_calls(self) -> None:
+        items = build_output_items(
+            content="喵~",
+            reasoning="想一下",
+            tool_calls=[
+                {"id": "call_A", "type": "function", "function": {"name": "reply", "arguments": {"text": "在"}}}
+            ],
+        )
+        self.assertEqual(
+            [item["item_type"] for item in items],
+            ["ReasoningItem", "AssistantMessageItem", "FunctionCallItem"],
+        )
+
+    def test_text_is_stripped(self) -> None:
+        items = build_output_items(content="  喵~  ", reasoning=" 想 ", tool_calls=[])
+        self.assertEqual(items[0]["text_parts"], ["想"])
+        self.assertEqual(items[1]["parts"], [{"type": "text", "text": "喵~"}])
+
+    def test_empty_response_yields_no_items(self) -> None:
+        self.assertEqual(build_output_items(content="   ", reasoning="", tool_calls=[]), [])
+
+    def test_no_meta_provided(self) -> None:
+        """meta（item_id/logical_turn_id/timestamp）由宿主覆盖，插件不应提供。"""
+
+        items = build_output_items(content="hi", reasoning="", tool_calls=[])
+        self.assertNotIn("meta", items[0])
+
+    def test_reasoning_uses_raw_text_representation(self) -> None:
+        items = build_output_items(content="", reasoning="思考", tool_calls=[])
+        self.assertEqual(items[0]["representation"], "raw_text")
+        self.assertEqual(items[0]["summary_parts"], [])
+
+    def test_tool_call_arguments_string_is_parsed(self) -> None:
+        items = build_output_items(
+            content="",
+            reasoning="",
+            tool_calls=[{"id": "c1", "type": "function", "function": {"name": "f", "arguments": '{"a": 1}'}}],
+        )
+        self.assertEqual(items[0]["tool_call"]["args"], {"a": 1})
+
+    def test_tool_call_arguments_dict_is_kept(self) -> None:
+        items = build_output_items(
+            content="",
+            reasoning="",
+            tool_calls=[{"id": "c1", "type": "function", "function": {"name": "f", "arguments": {"a": 2}}}],
+        )
+        self.assertEqual(items[0]["tool_call"]["args"], {"a": 2})
+        self.assertEqual(items[0]["tool_call"]["call_id"], "c1")
+        self.assertEqual(items[0]["tool_call"]["func_name"], "f")
+
+    def test_incomplete_tool_call_is_skipped(self) -> None:
+        items = build_output_items(
+            content="",
+            reasoning="",
+            tool_calls=[
+                {"type": "function", "function": {"name": "no_id", "arguments": {}}},
+                {"id": "c2", "type": "function", "function": {"arguments": {}}},
+            ],
+        )
+        self.assertEqual(items, [])
+
+    def test_extra_content_is_preserved(self) -> None:
+        items = build_output_items(
+            content="",
+            reasoning="",
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "f", "arguments": {}},
+                    "extra_content": {"source": "response"},
+                }
+            ],
+        )
+        self.assertEqual(items[0]["tool_call"]["extra_content"], {"source": "response"})
 
 
 if __name__ == "__main__":

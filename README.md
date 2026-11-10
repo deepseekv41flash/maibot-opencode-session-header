@@ -33,7 +33,9 @@ MaiBot 允许插件注册自己的 **LLM Provider**（对应模型配置里的 `
 2. 读取本次请求的 `api_provider.base_url`，判断是否命中 `opencode.ai`（含子域）；
 3. 命中时按优先级解析会话种子，做 SHA-256 截断哈希，注入会话头；
 4. 未命中时**不添加任何请求头**，请求体原样转发 —— 与内置客户端行为一致；
-5. 把网关响应还原成宿主可消费的结构（正文 / 推理内容 / 工具调用 / usage）。
+5. 把网关响应还原成宿主可消费的结构 —— **优先返回新版 Item 数组**
+   （`output_items` + `item_schema_version`），同时保留 `content`/`reasoning_content`/
+   `tool_calls` 标量字段以兼容旧版宿主（见 5.2）。
 
 线上协议由你选用的 `client_type` 决定，**不再有全局协议开关**，因此两种协议
 可以同时使用（见 5.1）。
@@ -244,6 +246,40 @@ POST /zen/go/v1/responses        -> 401 AuthError: Missing API key.
   所以**不会因为这一项被网关拒绝**；
 * 主程序内置客户端在 replay 作用域不匹配时，走的也是同样的「丢弃 reasoning」降级路径。
 
+## 5.2 响应协议：优先返回 Item 数组（`output_items`）
+
+宿主日志里如果出现：
+
+```
+插件 LLM Provider 返回旧版 content/reasoning/tool_calls 标量协议；
+该兼容入口将在下一个 Item schema 版本删除
+```
+
+说明插件返回的是**旧版标量协议**。1.5.0 起插件改为**优先返回新版 Item 数组**：
+
+```python
+result["item_schema_version"] = 1          # 与宿主 CONTEXT_ITEM_SCHEMA_VERSION 对齐
+result["output_items"] = [
+    {"item_type": "ReasoningItem", "representation": "raw_text",
+     "summary_parts": [], "text_parts": ["…"]},
+    {"item_type": "AssistantMessageItem", "parts": [{"type": "text", "text": "…"}]},
+    {"item_type": "FunctionCallItem",
+     "tool_call": {"call_id": "…", "func_name": "…", "args": {…}}},
+]
+```
+
+要点：
+
+* **顺序**固定为 reasoning → 正文 → 工具调用，语义对齐宿主
+  `build_portable_output_items`；文本先 `strip()`，空串不产生 Item；
+* **不提供 `meta`**：宿主会为每个 Item 覆盖 `item_id` / `logical_turn_id` / `timestamp`；
+* **标量字段仍然保留**：旧版宿主（没有 `output_items` 分支）仍可正常工作；
+* **版本号回显**：`item_schema_version` 取宿主请求里的值。若宿主升级到本插件未验证过的
+  版本，插件会记一条 warning 并仍按已验证格式输出；出现「output_items 非法」
+  说明格式已变，需要升级插件。
+
+配置无需改动，升级插件版本即可。
+
 ## 6. 命令与工具
 
 | 类型 | 名称 | 用途 |
@@ -375,6 +411,22 @@ opencode-session-header/
 `999.999.999`，只认真约束 `min_version`。
 
 ## 12. 变更记录
+
+### 1.5.0
+
+响应协议迁移到宿主的**新版 Item 数组**，消除「旧版 content/reasoning/tool_calls 标量协议」
+警告，避免该兼容入口被删除后插件不可用。
+
+* 新增 `build_output_items()`：把正文 / 推理 / 工具调用投影为 `output_items`
+  （`ReasoningItem` → `AssistantMessageItem` → `FunctionCallItem`），语义对齐宿主
+  `build_portable_output_items`：先 `strip()`、空内容不产生 Item、不提供 `meta`；
+* Provider 结果新增 `output_items` 与 `item_schema_version`，宿主 `PluginLLMClient`
+  会走新路径，不再打印旧版协议警告；
+* `item_schema_version` **回显宿主请求中的版本**；若宿主版本超出本插件已验证范围
+  （当前为 `1`），记一条 warning 并仍输出 Items，便于定位「格式已变」的情况；
+* **保留** `content` / `reasoning_content` / `tool_calls` 标量字段，兼容旧版宿主；
+* 工具参数若为 JSON 字符串会被解析为字典（真实链路里上游已解析，此为兜底）；
+* 无配置变更，`config_version` 保持 `1.4.0`；升级只需替换插件文件。
 
 ### 1.4.0
 
